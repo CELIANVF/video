@@ -5,6 +5,7 @@ import numpy as np
 import screeninfo
 from collections import deque
 import argparse
+import os
 
 # Global variables (to be initialized in main)
 frame_buffer = None
@@ -26,10 +27,17 @@ def save_last_x_seconds_of_video():
 
     # Use the size of the first frame in the buffer
     frame_height, frame_width = local_frame_buffer[0].shape[:2]
-    video_name = f'./video/video_{int(time.time())}.mov'
+    # Ensure output directory exists
+    os.makedirs('./video', exist_ok=True)
+    video_name = f'./video/video_{int(time.time())}.avi'
 
     try:
-        video_writer = cv2.VideoWriter(video_name, cv2.VideoWriter_fourcc(*'mp4v'), frame_rate, (frame_width, frame_height))
+        # Check frame size
+        if frame_width == 0 or frame_height == 0:
+            print("Invalid frame size for video writer.")
+            return
+        # Use XVID codec for better compatibility
+        video_writer = cv2.VideoWriter(video_name, cv2.VideoWriter_fourcc(*'XVID'), frame_rate, (frame_width, frame_height))
         if not video_writer.isOpened():
             print(f"Failed to open video writer for {video_name}.")
             return
@@ -39,7 +47,8 @@ def save_last_x_seconds_of_video():
     except Exception as e:
         print(f"Error while saving video: {e}")
     finally:
-        video_writer.release()
+        if 'video_writer' in locals():
+            video_writer.release()
         print("Video saved successfully")
 
 # Add a global variable to track if dimensions have been printed
@@ -98,16 +107,21 @@ def main(frame_rate_arg, buffer_duration_arg):
     frame_buffer = deque(maxlen=frame_rate * buffer_duration)  # Buffer to store last X seconds' worth of frames
     frame_buffer_lock = threading.Lock()  # Lock for accessing the frame buffer
 
-    cap = cv2.VideoCapture(2)
+    cap = cv2.VideoCapture(0)  # Open the default camera (change the index if you have multiple cameras)
     if not cap.isOpened():
         print("Failed to open the camera.")
         return
+    # Print camera FPS
+    print("Camera FPS:", cap.get(cv2.CAP_PROP_FPS))
 
     screen_width, screen_height = get_screen_resolution()
     real_fps_count = 0
     last_fps_update_time = time.time()
 
     try:
+        # Make the window resizable
+        cv2.namedWindow("Frame", cv2.WINDOW_NORMAL)
+        window_resized = False
         while True:
             local_start = time.time()
             frame = capture_image(cap, screen_width, screen_height)
@@ -125,22 +139,18 @@ def main(frame_rate_arg, buffer_duration_arg):
                     print(f"Current Real FPS: {real_fps_count}")
                     last_fps_update_time = time.time()
                     real_fps_count = 0
-                    
 
                 # Define the width of the rectangle you want to add
                 rectangle_width = int(frame_width/3)   # Adjust this value as needed
 
                 # Create a new image with the wider width
                 new_width = frame_width + rectangle_width
-                
                 new_height = frame_height
-                # print(f"New width: {new_width}, New height: {new_height}")
 
                 # Create a blank image (black) with the new dimensions
                 wider_image = np.zeros((new_height, new_width, 3), dtype=np.uint8)
 
                 # Place the original frame on the right side of the new image
-                # Move the original frame to the right by rectangle_width
                 wider_image[:, rectangle_width:] = oldest_frame
 
                 # Draw a black rectangle on the left side of the new image
@@ -156,15 +166,10 @@ def main(frame_rate_arg, buffer_duration_arg):
                 # Display controls for the user
                 control_text = (
                     # "+ : Augmenter FPS\n"
-
                     # "- : Diminuer FPS\n"
-
                     "+ : Augmenter la duree du delai\n"
-
                     "- : Diminuer la duree du delai\n"
-
                     "s : sauvegarder la video\n"
-
                     "q : Quitter"
                 )
 
@@ -172,30 +177,25 @@ def main(frame_rate_arg, buffer_duration_arg):
                 for i, line in enumerate(control_text.splitlines()):
                     cv2.putText(wider_image, line, (10, 170 + i * 30), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1, cv2.LINE_AA)
 
+                # Set the window size to match the image only once
+                if not window_resized:
+                    cv2.resizeWindow("Frame", new_width, new_height)
+                    window_resized = True
                 # Show the new wider image
                 cv2.imshow("Frame", wider_image)
-
 
             key = cv2.waitKey(1)
             if key & 0xFF == ord('q'):
                 break
             elif key & 0xFF == ord('s'):
                 save_video_thread()
-            # elif key & 0xFF == ord('+'):  # Increase frame rate
-            #     frame_rate += 1
-            #     # print(f"Frame rate increased to {frame_rate} FPS")
-            # elif key & 0xFF == ord('-'):  # Decrease frame rate
-            #     frame_rate = max(1, frame_rate - 1)  # Prevent frame rate from going below 1
-                # print(f"Frame rate decreased to {frame_rate} FPS")
             elif key & 0xFF == ord('+'):  # Increase buffer duration
                 buffer_duration += 1
                 frame_buffer = deque(maxlen=frame_rate * buffer_duration)  # Adjust buffer size
-                # print(f"Buffer duration increased to {buffer_duration} seconds")
             elif key & 0xFF == ord('-'):  # Decrease buffer duration
                 if buffer_duration > 1:  # Prevent buffer duration from going below 1
                     buffer_duration -= 1
                     frame_buffer = deque(maxlen=frame_rate * buffer_duration)  # Adjust buffer size
-                    # print(f"Buffer duration decreased to {buffer_duration} seconds")
 
             # Maintain the target frame rate
             elapsed_time = time.time() - local_start
@@ -208,7 +208,7 @@ def main(frame_rate_arg, buffer_duration_arg):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Capture and save video frames.")
-    parser.add_argument("--frame_rate", type=int, default=25, help="Frame rate for video capture.")
+    parser.add_argument("--frame_rate", type=int, default=30, help="Frame rate for video capture.")
     parser.add_argument("--buffer_duration", type=int, default=5, help="Duration of the frame buffer in seconds.")
 
     args = parser.parse_args()
