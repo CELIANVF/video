@@ -1,9 +1,11 @@
-"""Protocole TCP : ligne d’identification puis trames JPEG préfixées par la longueur."""
+"""Protocole TCP : ligne CAMERA puis JPEG (legacy) ou V2 (JPEG + PCM optionnel)."""
 
 import struct
-from typing import BinaryIO
 
 HEADER_MAX = 256
+
+PT_VIDEO = 1
+PT_AUDIO = 2
 
 
 def read_line(sock) -> str:
@@ -45,3 +47,59 @@ def recv_jpeg_frame(sock) -> bytes:
 
 def send_jpeg_frame(sock, jpeg: bytes) -> None:
     sock.sendall(struct.pack(">I", len(jpeg)) + jpeg)
+
+
+def send_v2_header(sock, with_audio: bool, sample_rate: int = 16000, channels: int = 1) -> None:
+    sock.sendall(b"V2\n")
+    if with_audio:
+        sock.sendall(f"AUDIO {sample_rate} {channels}\n".encode("utf-8"))
+
+
+def send_v2_packet(sock, packet_type: int, payload: bytes) -> None:
+    sock.sendall(
+        bytes([packet_type & 0xFF]) + struct.pack(">I", len(payload)) + payload
+    )
+
+
+def recv_v2_packet(sock) -> tuple[int, bytes]:
+    typ_b = recv_exact(sock, 1)
+    typ = typ_b[0]
+    (ln,) = struct.unpack(">I", recv_exact(sock, 4))
+    if ln > 50 * 1024 * 1024:
+        raise ValueError(f"paquet V2 trop grand: {ln}")
+    return typ, recv_exact(sock, ln)
+
+
+def peel_transport(conn) -> tuple[str, object]:
+    """
+    Après la ligne CAMERA : détecte legacy (1er JPEG) ou V2.
+
+    Retourne :
+      ('legacy', jpeg_bytes)
+      ('v2', (sr, ch) | None)  # None = pas d’audio annoncé
+    """
+    b0 = recv_exact(conn, 1)
+    if b0 == b"V":
+        line = bytearray(b"V")
+        while len(line) < HEADER_MAX:
+            c = conn.recv(1)
+            if not c:
+                raise ConnectionError("fin de flux (V2)")
+            if c == b"\n":
+                break
+            line.extend(c)
+        if line.decode("utf-8", errors="replace").strip() != "V2":
+            raise ValueError("en-tête V2 attendu après V")
+        nxt = read_line(conn)
+        audio = None
+        if nxt.upper().startswith("AUDIO "):
+            parts = nxt.split()
+            if len(parts) >= 3:
+                audio = (int(parts[1]), int(parts[2]))
+        return "v2", audio
+    ln_bytes = b0 + recv_exact(conn, 3)
+    (length,) = struct.unpack(">I", ln_bytes)
+    if length > 50 * 1024 * 1024:
+        raise ValueError(f"trame JPEG anormalement grande: {length}")
+    jpeg = recv_exact(conn, length)
+    return "legacy", jpeg
