@@ -49,6 +49,16 @@ def main() -> None:
         metavar="SPEC",
         help="Caméra locale sur le serveur. Ex: --local 0 --local cam_b:1",
     )
+    parser.add_argument(
+        "--gui",
+        action="store_true",
+        help="Interface PyQt6 : grille + fenêtres détachables redimensionnables",
+    )
+    parser.add_argument(
+        "--debug-fps",
+        action="store_true",
+        help="Journal chaque seconde les débits par étape (réception/décodage/append) par flux réseau",
+    )
     args = parser.parse_args()
 
     local_devices = [_parse_local(s) for s in args.local]
@@ -58,6 +68,8 @@ def main() -> None:
         frame_rate=args.frame_rate,
         buffer_duration=args.buffer_duration,
         local_devices=local_devices,
+        gui=args.gui,
+        debug_fps=args.debug_fps,
     )
 
 

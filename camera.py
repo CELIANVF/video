@@ -2,6 +2,7 @@
 """
 Client caméra : envoie un flux vidéo (webcam, RTSP, etc.) vers le serveur (main.py).
 Avec --audio : protocole V2 + micro (PCM 16 bits), muxé côté serveur dans le MP4 en REC.
+Débit audio par défaut : natif du micro (--audio-rate 0).
 """
 
 from __future__ import annotations
@@ -9,10 +10,19 @@ from __future__ import annotations
 import argparse
 import queue
 import socket
+import threading
 import time
+from typing import Any, Callable
 
 import cv2
+import numpy as np
 
+from video_app.capture import (
+    configure_webcam_best_effort,
+    configure_webcam_for_send_size,
+    is_local_opencv_capture_device,
+)
+from video_app.fast_jpeg import encode_bgr_jpeg_best, turbojpeg_available
 from video_app.protocol import (
     PT_AUDIO,
     PT_VIDEO,
@@ -24,8 +34,114 @@ from video_app.protocol import (
 
 try:
     import sounddevice as sd
-except ImportError:
+except (ImportError, OSError):
     sd = None
+
+
+class _ClientFpsDiag:
+    """Impression 1 Hz : lecture caméra, encodage JPEG, envoi TCP (vidéo + paquets audio)."""
+
+    def __init__(self, label: str) -> None:
+        self._label = label
+        self._lock = threading.Lock()
+        self._c = {"read": 0, "encode": 0, "send_v": 0, "audio_pkt": 0}
+        self._stop = threading.Event()
+        self._th = threading.Thread(target=self._loop, daemon=True)
+        self._th.start()
+
+    def bump(self, key: str, n: int = 1) -> None:
+        with self._lock:
+            self._c[key] = self._c.get(key, 0) + n
+
+    def _loop(self) -> None:
+        while not self._stop.wait(1.0):
+            with self._lock:
+                s = self._c.copy()
+                for k in self._c:
+                    self._c[k] = 0
+            print(
+                f"[debug-fps client {self._label}] read={s['read']} img/s | "
+                f"encode={s['encode']}/s | send_video={s['send_v']}/s | "
+                f"audio_pkt={s['audio_pkt']}/s"
+            )
+
+    def close(self) -> None:
+        self._stop.set()
+
+
+def _output_dimensions(
+    native_w: int, native_h: int, req_w: int, req_h: int
+) -> tuple[int, int]:
+    """Taille des images envoyées après redimensionnement éventuel."""
+    if native_w <= 0 or native_h <= 0:
+        return max(0, req_w), max(0, req_h)
+    if req_w > 0 and req_h > 0:
+        return req_w, req_h
+    if req_w > 0:
+        scale = req_w / native_w
+        return req_w, max(1, int(native_h * scale))
+    if req_h > 0:
+        scale = req_h / native_h
+        return max(1, int(native_w * scale)), req_h
+    return native_w, native_h
+
+
+def _open_audio_input_stream(
+    preferred_sr: int,
+    channels: int,
+    callback: Callable[..., None],
+) -> tuple[Any, int]:
+    """Ouvre la capture ; essaie plusieurs débits car ALSA refuse souvent 16 kHz natif."""
+    if sd is None:
+        raise RuntimeError("sounddevice indisponible")
+    try:
+        di = sd.query_devices(kind="input")
+        default_sr = int(float(di["default_samplerate"]))
+    except Exception:
+        default_sr = 48000
+    seen: set[int] = set()
+    candidates: list[int] = []
+    order: list[int] = []
+    if preferred_sr > 0:
+        order.append(preferred_sr)
+    order.extend(
+        [
+            default_sr,
+            48000,
+            44100,
+            96000,
+            32000,
+            24000,
+            22050,
+            16000,
+            8000,
+        ]
+    )
+    for sr in order:
+        sr = int(sr)
+        if sr > 0 and sr not in seen:
+            seen.add(sr)
+            candidates.append(sr)
+    last_err: BaseException | None = None
+    for sr in candidates:
+        blocksize = max(160, sr // 50)
+        try:
+            stream = sd.RawInputStream(
+                samplerate=sr,
+                channels=channels,
+                dtype="int16",
+                blocksize=blocksize,
+                callback=callback,
+            )
+        except sd.PortAudioError as e:
+            last_err = e
+            continue
+        stream.start()
+        return stream, sr
+    raise RuntimeError(
+        "Aucun débit d’échantillonnage accepté par le micro. "
+        "Dernière erreur PortAudio : " + str(last_err)
+    ) from last_err
 
 
 def main() -> None:
@@ -44,16 +160,21 @@ def main() -> None:
     )
     p.add_argument("--jpeg-quality", type=int, default=85, help="Qualité JPEG 1-100")
     p.add_argument(
+        "--sequential-encode",
+        action="store_true",
+        help="Désactive le chevauchement lecture caméra / encodage JPEG (un seul fil)",
+    )
+    p.add_argument(
         "--width",
         type=int,
         default=0,
-        help="Largeur max (0 = taille source)",
+        help="Largeur d’envoi (0 = native). La webcam locale est quand même ouverte en HD/MJPEG.",
     )
     p.add_argument(
         "--height",
         type=int,
         default=0,
-        help="Hauteur max (0 = taille source)",
+        help="Hauteur d’envoi (0 = native). Combiné à --width pour forcer la taille JPEG.",
     )
     p.add_argument("--fps", type=float, default=0, help="Limite FPS (0 = max possible)")
     p.add_argument(
@@ -61,12 +182,27 @@ def main() -> None:
         action="store_true",
         help="Capturer le micro et l’envoyer (REC continu sur le serveur → MP4 avec son)",
     )
-    p.add_argument("--audio-rate", type=int, default=16000, help="Hz (PCM 16 bits)")
+    p.add_argument(
+        "--audio-rate",
+        type=int,
+        default=0,
+        help="Hz PCM 16 bits (0 = débit natif du micro d’abord, moins d’erreurs ALSA) ; sinon ex. 16000",
+    )
     p.add_argument("--audio-channels", type=int, default=1, help="1 = mono")
+    p.add_argument(
+        "--debug-fps",
+        action="store_true",
+        help="Chaque seconde : débit read caméra / encodage JPEG / envoi vidéo + paquets audio",
+    )
     args = p.parse_args()
 
     if args.audio and sd is None:
-        print("Le module sounddevice est requis pour --audio : pip install sounddevice")
+        print(
+            "Audio indisponible : installez sounddevice (pip) et la bibliothèque PortAudio.\n"
+            "  Debian/Ubuntu : sudo apt install libportaudio2\n"
+            "  Fedora : sudo dnf install portaudio\n"
+            "  Puis : pip install sounddevice"
+        )
         return
 
     try:
@@ -78,6 +214,39 @@ def main() -> None:
     if not cap.isOpened():
         print(f"Impossible d’ouvrir la source: {args.device!r}")
         return
+
+    probe_local = is_local_opencv_capture_device(dev)
+    apply_fps_cap = args.fps == 0 and probe_local
+    # Si --width et --height : capturer au plus petit format MJPEG qui couvre cette
+    # taille (sinon on reste en 5 Mpx et cap.read() plafonne souvent ~15 img/s).
+    if probe_local and args.width > 0 and args.height > 0:
+        eff_w, eff_h, eff_fps = configure_webcam_for_send_size(
+            cap,
+            args.width,
+            args.height,
+            apply_fps=apply_fps_cap,
+        )
+        apply_native_configure = True
+    else:
+        apply_native_configure = probe_local
+        eff_w, eff_h, eff_fps = configure_webcam_best_effort(
+            cap,
+            apply_resolution=apply_native_configure,
+            apply_fps=apply_fps_cap,
+        )
+    out_w, out_h = _output_dimensions(eff_w, eff_h, args.width, args.height)
+    if probe_local and (apply_native_configure or apply_fps_cap):
+        fps_str = f"{eff_fps:g}" if eff_fps > 0 else "?"
+        if eff_w > 0 and eff_h > 0:
+            if out_w != eff_w or out_h != eff_h:
+                print(
+                    f"Capture : {eff_w}×{eff_h} px (native) → envoi {out_w}×{out_h} px, "
+                    f"FPS signalé ≈ {fps_str}"
+                )
+            else:
+                print(f"Capture : {eff_w}×{eff_h} px, FPS signalé ≈ {fps_str}")
+        else:
+            print(f"Capture : taille native inconnue, FPS signalé ≈ {fps_str}")
 
     sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
@@ -98,70 +267,179 @@ def main() -> None:
             if status:
                 print(status)
             try:
-                audio_q.put_nowait(indata.copy().tobytes())
+                # RawInputStream : indata est un buffer CFFI, pas un ndarray (pas de .copy()).
+                audio_q.put_nowait(bytes(indata))
             except queue.Full:
                 pass
 
-        audio_stream = sd.RawInputStream(
-            samplerate=args.audio_rate,
-            channels=args.audio_channels,
-            dtype="int16",
-            blocksize=max(160, args.audio_rate // 50),
-            callback=_audio_cb,
-        )
-        audio_stream.start()
+        try:
+            audio_stream, audio_sr = _open_audio_input_stream(
+                args.audio_rate, args.audio_channels, _audio_cb
+            )
+        except (RuntimeError, sd.PortAudioError) as e:
+            print(e)
+            sock.close()
+            cap.release()
+            return
+        if args.audio_rate > 0 and audio_sr != args.audio_rate:
+            print(
+                f"Micro : {audio_sr} Hz utilisés "
+                f"({args.audio_rate} Hz refusés par le périphérique)."
+            )
         send_v2_header(
-            sock, True, sample_rate=args.audio_rate, channels=args.audio_channels
+            sock, True, sample_rate=audio_sr, channels=args.audio_channels
         )
     print(f"Flux « {args.name} » → {args.host}:{args.port}" + (" (+ audio)" if args.audio else ""))
+    if turbojpeg_available():
+        print("JPEG : TurboJPEG (libjpeg-turbo) — encodage plus rapide que OpenCV seul.")
+    else:
+        print(
+            "JPEG : OpenCV seul. Installez PyTurboJPEG + libturbojpeg pour accélérer "
+            "(ex. Ubuntu : sudo apt install libturbojpeg0-dev ; pip install PyTurboJPEG)."
+        )
 
-    encode_params = [int(cv2.IMWRITE_JPEG_QUALITY), max(1, min(100, args.jpeg_quality))]
+    fps_diag: _ClientFpsDiag | None = None
+    if args.debug_fps:
+        fps_diag = _ClientFpsDiag(args.name)
+        print(
+            "[debug-fps] client : read = images lues (après resize) ; encode = JPEG produits ; "
+            "send_video = paquets vidéo TCP ; audio_pkt = paquets audio TCP (v2)."
+        )
+
     min_interval = 1.0 / args.fps if args.fps and args.fps > 0 else 0.0
     last_send = 0.0
+    q = max(1, min(100, args.jpeg_quality))
+
+    def _process_frame(raw: np.ndarray) -> np.ndarray:
+        h, w = raw.shape[:2]
+        if args.width > 0 and args.height > 0:
+            return cv2.resize(raw, (args.width, args.height))
+        if args.width > 0:
+            scale = args.width / w
+            return cv2.resize(raw, (args.width, max(1, int(h * scale))))
+        if args.height > 0:
+            scale = args.height / h
+            return cv2.resize(raw, (max(1, int(w * scale)), args.height))
+        return raw
+
+    def _send_jpeg(jpeg_b: bytes) -> bool:
+        try:
+            if args.audio:
+                send_v2_packet(sock, PT_VIDEO, jpeg_b)
+                for _ in range(12):
+                    try:
+                        pcm = audio_q.get_nowait()
+                        send_v2_packet(sock, PT_AUDIO, pcm)
+                        if fps_diag:
+                            fps_diag.bump("audio_pkt")
+                    except queue.Empty:
+                        break
+            else:
+                send_jpeg_frame(sock, jpeg_b)
+        except OSError as e:
+            print(f"Envoi interrompu: {e}")
+            return False
+        return True
+
+    use_pipeline = not args.sequential_encode
 
     try:
-        while True:
-            if min_interval:
-                now = time.time()
-                wait = min_interval - (now - last_send)
-                if wait > 0:
-                    time.sleep(wait)
+        if use_pipeline:
+            in_q: queue.Queue[np.ndarray | None] = queue.Queue(maxsize=2)
+            out_q: queue.Queue[bytes] = queue.Queue(maxsize=2)
 
-            ok, frame = cap.read()
-            if not ok or frame is None:
-                print("Fin de flux ou erreur de lecture.")
-                break
+            def _encode_worker() -> None:
+                while True:
+                    fr = in_q.get()
+                    if fr is None:
+                        break
+                    jpeg_b = encode_bgr_jpeg_best(fr, q)
+                    if jpeg_b:
+                        if fps_diag:
+                            fps_diag.bump("encode")
+                        out_q.put(jpeg_b)
 
-            h, w = frame.shape[:2]
-            if args.width > 0 and args.height > 0:
-                frame = cv2.resize(frame, (args.width, args.height))
-            elif args.width > 0:
-                scale = args.width / w
-                frame = cv2.resize(frame, (args.width, max(1, int(h * scale))))
-            elif args.height > 0:
-                scale = args.height / h
-                frame = cv2.resize(frame, (max(1, int(w * scale)), args.height))
+            enc_th = threading.Thread(target=_encode_worker, daemon=True)
+            enc_th.start()
 
-            ok, jpeg = cv2.imencode(".jpg", frame, encode_params)
-            if not ok:
-                continue
-            jpeg_b = jpeg.tobytes()
+            def _read_one() -> np.ndarray | None:
+                nonlocal last_send
+                if min_interval:
+                    now = time.time()
+                    wait = min_interval - (now - last_send)
+                    if wait > 0:
+                        time.sleep(wait)
+                ok, frame = cap.read()
+                if not ok or frame is None:
+                    return None
+                last_send = time.time()
+                out = _process_frame(frame)
+                if fps_diag:
+                    fps_diag.bump("read")
+                return out
+
             try:
-                if args.audio:
-                    send_v2_packet(sock, PT_VIDEO, jpeg_b)
-                    for _ in range(12):
-                        try:
-                            pcm = audio_q.get_nowait()
-                            send_v2_packet(sock, PT_AUDIO, pcm)
-                        except queue.Empty:
-                            break
+                f0 = _read_one()
+                if f0 is None:
+                    print("Fin de flux ou erreur de lecture.")
                 else:
-                    send_jpeg_frame(sock, jpeg_b)
-            except OSError as e:
-                print(f"Envoi interrompu: {e}")
-                break
-            last_send = time.time()
+                    in_q.put(f0)
+                    f1 = _read_one()
+                    if f1 is None:
+                        print("Fin de flux ou erreur de lecture.")
+                        try:
+                            jpeg_b = out_q.get(timeout=30.0)
+                        except queue.Empty:
+                            jpeg_b = b""
+                        if jpeg_b:
+                            if _send_jpeg(jpeg_b) and fps_diag:
+                                fps_diag.bump("send_v")
+                    else:
+                        in_q.put(f1)
+                        while True:
+                            jpeg_b = out_q.get()
+                            ok_send = _send_jpeg(jpeg_b)
+                            if ok_send and fps_diag:
+                                fps_diag.bump("send_v")
+                            if not ok_send:
+                                break
+                            f_next = _read_one()
+                            if f_next is None:
+                                print("Fin de flux ou erreur de lecture.")
+                                break
+                            in_q.put(f_next)
+            finally:
+                in_q.put(None)
+                enc_th.join(timeout=3.0)
+        else:
+            while True:
+                if min_interval:
+                    now = time.time()
+                    wait = min_interval - (now - last_send)
+                    if wait > 0:
+                        time.sleep(wait)
+
+                ok, frame = cap.read()
+                if not ok or frame is None:
+                    print("Fin de flux ou erreur de lecture.")
+                    break
+
+                frame = _process_frame(frame)
+                if fps_diag:
+                    fps_diag.bump("read")
+                jpeg_b = encode_bgr_jpeg_best(frame, q)
+                if not jpeg_b:
+                    continue
+                if fps_diag:
+                    fps_diag.bump("encode")
+                if not _send_jpeg(jpeg_b):
+                    break
+                if fps_diag:
+                    fps_diag.bump("send_v")
+                last_send = time.time()
     finally:
+        if fps_diag is not None:
+            fps_diag.close()
         if audio_stream is not None:
             audio_stream.stop()
             audio_stream.close()

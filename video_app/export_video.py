@@ -4,15 +4,16 @@ from __future__ import annotations
 
 import os
 import time
+from typing import Any
 
 import cv2
 import numpy as np
 
 from video_app import ffmpeg_io
-from video_app.buffer import StreamBuffer
+from video_app.buffer import StreamBuffer, effective_fps_from_timestamps
 
 
-def _write_video_file(path: str, frames: list, fps: int, label: str) -> bool:
+def _write_video_file(path: str, frames: list, fps: float, label: str) -> bool:
     if not frames:
         print(f"[{label}] Aucune image à enregistrer.")
         return False
@@ -29,7 +30,7 @@ def _write_video_file(path: str, frames: list, fps: int, label: str) -> bool:
     elif path.endswith(".mp4"):
         path = path[:-4] + ".avi"
     writer = cv2.VideoWriter(
-        path, cv2.VideoWriter_fourcc(*"XVID"), max(1, fps), (w, h)
+        path, cv2.VideoWriter_fourcc(*"XVID"), float(max(1.0, fps)), (w, h)
     )
     if not writer.isOpened():
         print(f"[{label}] Impossible d’ouvrir le writer pour {path}.")
@@ -74,18 +75,22 @@ def save_per_stream_and_stack(
     """
     ts = ts if ts is not None else int(time.time())
     ext = ".mp4" if ffmpeg_io.ffmpeg_available() else ".avi"
-    snapshots: list[tuple[str, list]] = [
-        (b.stream_id, b.snapshot_frames()) for b in buffers
+    fb = float(frame_rate)
+    snapshots: list[tuple[str, list[tuple[float, Any]]]] = [
+        (b.stream_id, b.snapshot_timed()) for b in buffers
     ]
 
-    for stream_id, frames in snapshots:
-        if not frames:
+    for stream_id, timed in snapshots:
+        if not timed:
             print(f"[{stream_id}] Aucune image à enregistrer.")
             continue
+        frames = [fr for _, fr in timed]
+        times = [t for t, _ in timed]
+        fps = effective_fps_from_timestamps(times, fb)
         path = f"./video/{stream_id}_{ts}{ext}"
-        _write_video_file(path, frames, frame_rate, stream_id)
+        _write_video_file(path, frames, fps, stream_id)
 
-    non_empty = [(sid, fr) for sid, fr in snapshots if fr]
+    non_empty = [(sid, t) for sid, t in snapshots if t]
     if len(non_empty) < 2:
         if len(non_empty) == 1:
             print(
@@ -94,14 +99,23 @@ def save_per_stream_and_stack(
             )
         return
 
-    min_len = min(len(fr) for _, fr in non_empty)
+    min_len = min(len(t) for _, t in non_empty)
 
     stacked_frames: list[np.ndarray] = []
     for i in range(min_len):
-        row = [fr[i] for _, fr in non_empty]
+        row = [t[i][1] for _, t in non_empty]
         stacked = build_vertical_stack(row)
         if stacked is not None:
             stacked_frames.append(stacked)
 
+    fps_vals: list[float] = []
+    for _, timed in non_empty:
+        head = timed[:min_len]
+        if len(head) >= 2:
+            fps_vals.append(
+                effective_fps_from_timestamps([x[0] for x in head], fb)
+            )
+    fps_stack = sum(fps_vals) / len(fps_vals) if fps_vals else fb
+
     out = f"./video/stack_{ts}{ext}"
-    _write_video_file(out, stacked_frames, frame_rate, "stack")
+    _write_video_file(out, stacked_frames, fps_stack, "stack")

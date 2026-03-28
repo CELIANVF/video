@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import math
 import os
+import queue
 import socket
 import threading
 import time
@@ -16,8 +17,14 @@ import screeninfo
 
 from video_app import ffmpeg_io
 from video_app.buffer import StreamBuffer
-from video_app.capture import capture_resized
-from video_app.export_video import build_vertical_stack, save_per_stream_and_stack
+from video_app.capture import capture_resized, configure_webcam_best_effort
+from video_app.fast_jpeg import decode_jpeg_bgr, turbojpeg_available
+from video_app.display_core import (
+    close_continuous_stack_state,
+    gather_display_frames,
+    tick_continuous_stack_recording,
+)
+from video_app.export_video import save_per_stream_and_stack
 from video_app.protocol import (
     PT_AUDIO,
     PT_VIDEO,
@@ -101,12 +108,117 @@ class StreamRegistry:
             self.buffer_duration = seconds
 
 
+def _net_decode_worker_count() -> int:
+    n = os.cpu_count() or 4
+    return min(8, max(2, n))
+
+
+class _StreamPacketMerger:
+    """Réordonne vidéo (décodage JPEG parallèle) et audio pour des append séquentiels."""
+
+    def __init__(self) -> None:
+        self._cv = threading.Condition()
+        self._audio: dict[int, bytes] = {}
+        self._video: dict[int, np.ndarray | None] = {}
+        self._end_seq: int | None = None
+
+    def add_audio(self, seq: int, pcm: bytes) -> None:
+        with self._cv:
+            self._audio[seq] = pcm
+            self._cv.notify_all()
+
+    def add_video(self, seq: int, frame: np.ndarray | None) -> None:
+        with self._cv:
+            self._video[seq] = frame
+            self._cv.notify_all()
+
+    def set_stream_end(self, max_seq: int) -> None:
+        with self._cv:
+            self._end_seq = max_seq
+            self._cv.notify_all()
+
+    def run(
+        self,
+        buf: StreamBuffer,
+        fps_diag: _NetFpsDiag | None = None,
+    ) -> None:
+        next_seq = 1
+        while True:
+            kind = ""
+            pcm_out: bytes | None = None
+            video_out: np.ndarray | None = None
+            with self._cv:
+                while True:
+                    if self._end_seq is not None and next_seq > self._end_seq:
+                        return
+                    if next_seq in self._audio:
+                        pcm_out = self._audio.pop(next_seq)
+                        next_seq += 1
+                        kind = "a"
+                        break
+                    if next_seq in self._video:
+                        video_out = self._video.pop(next_seq)
+                        next_seq += 1
+                        kind = "v"
+                        break
+                    self._cv.wait()
+            if kind == "a" and pcm_out is not None:
+                if fps_diag:
+                    fps_diag.bump("append_a")
+                buf.append_audio(pcm_out)
+            elif kind == "v" and video_out is not None:
+                if fps_diag:
+                    fps_diag.bump("append_v")
+                buf.append(video_out, copy_frame=False)
+
+
+class _NetFpsDiag:
+    """Compteurs thread-safe + impression 1 Hz des étapes réseau → tampon."""
+
+    def __init__(self, label: str) -> None:
+        self._label = label
+        self._lock = threading.Lock()
+        self._c = {
+            "recv_pkt": 0,
+            "recv_vid": 0,
+            "recv_aud": 0,
+            "dispatch_vid": 0,
+            "decode": 0,
+            "append_v": 0,
+            "append_a": 0,
+        }
+        self._stop = threading.Event()
+        self._th = threading.Thread(target=self._loop, daemon=True)
+        self._th.start()
+
+    def bump(self, key: str, n: int = 1) -> None:
+        with self._lock:
+            self._c[key] = self._c.get(key, 0) + n
+
+    def _loop(self) -> None:
+        while not self._stop.wait(1.0):
+            with self._lock:
+                s = self._c.copy()
+                for k in self._c:
+                    self._c[k] = 0
+            print(
+                f"[debug-fps serveur {self._label}] "
+                f"recv_pkt={s['recv_pkt']}/s vid={s['recv_vid']}/s aud={s['recv_aud']}/s | "
+                f"dispatch_vid={s['dispatch_vid']}/s decode={s['decode']}/s | "
+                f"append_vid={s['append_v']}/s append_aud={s['append_a']}/s"
+            )
+
+    def close(self) -> None:
+        self._stop.set()
+
+
 def _client_loop(
     conn: socket.socket,
     addr,
     registry: StreamRegistry,
     stop_event: threading.Event,
     log: Callable[[str], None],
+    debug_fps: bool = False,
 ) -> None:
     stream_id = f"net_{addr[0]}_{addr[1]}"
     try:
@@ -121,41 +233,135 @@ def _client_loop(
 
     buf = registry.get_or_create(stream_id)
     log(f"flux connecté: {stream_id} depuis {addr}")
+    recv_thread: threading.Thread | None = None
+    dispatch_thread: threading.Thread | None = None
+    worker_threads: list[threading.Thread] = []
+    fps_diag: _NetFpsDiag | None = None
     try:
         mode, extra = peel_transport(conn)
-        if mode == "legacy":
-            jpeg = extra
-            arr = np.frombuffer(jpeg, dtype=np.uint8)
-            frame = cv2.imdecode(arr, cv2.IMREAD_COLOR)
-            if frame is not None:
-                buf.append(frame)
-            while not stop_event.is_set():
-                try:
-                    jpeg = recv_jpeg_frame(conn)
-                except (ConnectionError, ValueError, OSError):
+        if debug_fps:
+            fps_diag = _NetFpsDiag(stream_id)
+        if not turbojpeg_available():
+            log(
+                f"flux {stream_id}: JPEG sans TurboJPEG (plus lent) — "
+                "PyTurboJPEG + libturbojpeg recommandés"
+            )
+        # Réception TCP, dispatch ordonné, décodage JPEG sur plusieurs fils, fusion par n° de séquence.
+        ordered_q: queue.Queue[object] = queue.Queue(maxsize=128)
+        work_q: queue.Queue[object] = queue.Queue(maxsize=64)
+        merger = _StreamPacketMerger()
+        n_workers = _net_decode_worker_count()
+
+        def _dispatch_ordered() -> None:
+            while True:
+                item = ordered_q.get()
+                if isinstance(item, tuple) and len(item) == 2 and item[0] is None:
+                    _, max_seq = item
+                    merger.set_stream_end(int(max_seq))
+                    for _ in range(n_workers):
+                        work_q.put(None)
                     break
-                arr = np.frombuffer(jpeg, dtype=np.uint8)
-                frame = cv2.imdecode(arr, cv2.IMREAD_COLOR)
-                if frame is not None:
-                    buf.append(frame)
+                if not isinstance(item, tuple) or len(item) != 3:
+                    continue
+                seq_i, typ_i, data_i = item
+                seq_i = int(seq_i)
+                if typ_i == PT_VIDEO:
+                    if fps_diag:
+                        fps_diag.bump("dispatch_vid")
+                    work_q.put((seq_i, data_i))
+                elif typ_i == PT_AUDIO:
+                    merger.add_audio(seq_i, data_i)
+
+        def _decode_worker() -> None:
+            while True:
+                job = work_q.get()
+                if job is None:
+                    break
+                seq_j, jpeg_b = job  # type: ignore[misc]
+                fr = decode_jpeg_bgr(jpeg_b)
+                if fps_diag:
+                    fps_diag.bump("decode")
+                merger.add_video(int(seq_j), fr)
+
+        def _recv_legacy(jpeg0: bytes) -> None:
+            last_seq = 1
+            try:
+                if fps_diag:
+                    fps_diag.bump("recv_pkt")
+                    fps_diag.bump("recv_vid")
+                ordered_q.put((1, PT_VIDEO, jpeg0))
+                seq = 2
+                while not stop_event.is_set():
+                    jpeg = recv_jpeg_frame(conn)
+                    if fps_diag:
+                        fps_diag.bump("recv_pkt")
+                        fps_diag.bump("recv_vid")
+                    ordered_q.put((seq, PT_VIDEO, jpeg))
+                    last_seq = seq
+                    seq += 1
+            except (ConnectionError, ValueError, OSError):
+                pass
+            finally:
+                ordered_q.put((None, last_seq))
+
+        def _recv_v2() -> None:
+            last_seq = 0
+            try:
+                s = 1
+                while not stop_event.is_set():
+                    typ, data = recv_v2_packet(conn)
+                    if fps_diag:
+                        fps_diag.bump("recv_pkt")
+                        if typ == PT_VIDEO:
+                            fps_diag.bump("recv_vid")
+                        elif typ == PT_AUDIO:
+                            fps_diag.bump("recv_aud")
+                    ordered_q.put((s, typ, data))
+                    last_seq = s
+                    s += 1
+            except (ConnectionError, ValueError, OSError):
+                pass
+            finally:
+                ordered_q.put((None, last_seq))
+
+        dispatch_thread = threading.Thread(target=_dispatch_ordered, daemon=True)
+        dispatch_thread.start()
+        for _ in range(n_workers):
+            wt = threading.Thread(target=_decode_worker, daemon=True)
+            worker_threads.append(wt)
+            wt.start()
+
+        if mode == "legacy":
+            jpeg0: bytes = extra
+            recv_thread = threading.Thread(
+                target=_recv_legacy, args=(jpeg0,), daemon=True
+            )
+            recv_thread.start()
+            merger.run(buf, fps_diag)
         else:
             audio_params = extra
             if audio_params is not None:
                 buf.set_audio_params(audio_params[0], audio_params[1])
-                log(f"flux {stream_id}: audio {audio_params[0]} Hz, {audio_params[1]} canal(aux)")
-            while not stop_event.is_set():
-                try:
-                    typ, data = recv_v2_packet(conn)
-                except (ConnectionError, ValueError, OSError):
-                    break
-                if typ == PT_VIDEO:
-                    arr = np.frombuffer(data, dtype=np.uint8)
-                    frame = cv2.imdecode(arr, cv2.IMREAD_COLOR)
-                    if frame is not None:
-                        buf.append(frame)
-                elif typ == PT_AUDIO:
-                    buf.append_audio(data)
+                log(
+                    f"flux {stream_id}: audio {audio_params[0]} Hz, "
+                    f"{audio_params[1]} canal(aux)"
+                )
+            recv_thread = threading.Thread(target=_recv_v2, daemon=True)
+            recv_thread.start()
+            merger.run(buf, fps_diag)
     finally:
+        if fps_diag is not None:
+            fps_diag.close()
+        try:
+            conn.shutdown(socket.SHUT_RDWR)
+        except OSError:
+            pass
+        if recv_thread is not None:
+            recv_thread.join(timeout=3.0)
+        if dispatch_thread is not None:
+            dispatch_thread.join(timeout=3.0)
+        for wt in worker_threads:
+            wt.join(timeout=3.0)
         registry.remove(stream_id)
         log(f"flux déconnecté: {stream_id}")
         conn.close()
@@ -174,8 +380,12 @@ def _local_camera_loop(
     if not cap.isOpened():
         log(f"caméra locale {stream_id}: impossible d’ouvrir {device!r}")
         return
+    ew, eh, _ = configure_webcam_best_effort(
+        cap, apply_resolution=True, apply_fps=True
+    )
     buf = registry.get_or_create(stream_id)
-    log(f"caméra locale démarrée: {stream_id} ({device})")
+    dim = f"{ew}×{eh} px" if ew > 0 and eh > 0 else "résolution inconnue"
+    log(f"caméra locale {stream_id} ({device}) — {dim}")
     try:
         while not stop_event.is_set():
             frame = capture_resized(cap, target_w, target_h)
@@ -231,6 +441,8 @@ def run_server(
     frame_rate: int = 30,
     buffer_duration: int = 5,
     local_devices: list[tuple[str, int | str]] | None = None,
+    gui: bool = False,
+    debug_fps: bool = False,
 ) -> None:
     """
     local_devices: liste de (stream_id, device) ex. [("local_0", 0)].
@@ -280,7 +492,7 @@ def run_server(
             conn.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
             t = threading.Thread(
                 target=_client_loop,
-                args=(conn, addr, registry, stop_event, log),
+                args=(conn, addr, registry, stop_event, log, debug_fps),
                 daemon=True,
             )
             t.start()
@@ -290,8 +502,8 @@ def run_server(
     log(f"écoute sur {host}:{port} — lancez camera.py sur les machines caméra")
     if not ffmpeg_io.ffmpeg_available():
         log(
-            "ffmpeg absent : enregistrements en AVI (XVID). "
-            "Installez ffmpeg pour du MP4 H.264 lisible sur Android."
+            "ffmpeg introuvable (PATH ou « pip install imageio-ffmpeg ») : "
+            "REC en AVI OpenCV avec FPS mesuré sur le flux."
         )
 
     buffer_duration_live = buffer_duration
@@ -299,88 +511,62 @@ def run_server(
     display_delay_sec = float(max(1, min(5, buffer_duration)))
     real_fps_count = 0
     last_fps_time = time.time()
-    cv2.namedWindow("Frame", cv2.WINDOW_NORMAL)
 
-    cont_stack_writer = None
-    cont_stack_path: str | None = None
-    cont_stack_bound_session: int | None = None
+    stack_state: dict = {"writer": None, "path": None, "bound_session": None}
 
     def close_continuous_stack_writer() -> None:
-        nonlocal cont_stack_writer, cont_stack_path, cont_stack_bound_session
-        if cont_stack_writer is not None:
-            if hasattr(cont_stack_writer, "release"):
-                cont_stack_writer.release()
-            else:
-                code, err = cont_stack_writer.close()
-                if code != 0 and err:
-                    print(
-                        "[cont_stack] ffmpeg :",
-                        err.decode(errors="replace")[:200],
-                    )
-            cont_stack_writer = None
-            if cont_stack_path:
-                print(f"[cont_stack] Fichier terminé : {cont_stack_path}")
-            cont_stack_path = None
-        cont_stack_bound_session = None
+        close_continuous_stack_state(stack_state)
+
+    if gui:
+        try:
+            from video_app.qt_gui import run_qt_application
+        except ImportError as e:
+            print(
+                "Interface graphique indisponible. Installez PyQt6 : pip install PyQt6\n"
+                f"({e})"
+            )
+        else:
+
+            def _shutdown_socket() -> None:
+                try:
+                    server_sock.close()
+                except OSError:
+                    pass
+
+            try:
+                run_qt_application(
+                    registry=registry,
+                    frame_rate=frame_rate,
+                    buffer_duration=buffer_duration,
+                    grid_max_w=grid_max_w,
+                    grid_max_h=grid_max_h,
+                    stop_event=stop_event,
+                    stack_state=stack_state,
+                    on_shutdown=_shutdown_socket,
+                )
+            finally:
+                close_continuous_stack_writer()
+                registry.set_continuous_recording(False)
+                stop_event.set()
+                try:
+                    server_sock.close()
+                except OSError:
+                    pass
+            return
+
+    cv2.namedWindow("Frame", cv2.WINDOW_NORMAL)
 
     try:
         window_sized = False
         while True:
             loop_start = time.time()
+            frames_data = gather_display_frames(
+                registry, live_display, display_delay_sec
+            )
+            tick_continuous_stack_recording(
+                registry, frames_data, frame_rate, stack_state
+            )
             ids = registry.ids()
-            frames_data: list[tuple[str, np.ndarray]] = []
-            for sid in ids:
-                b = registry.get(sid)
-                if b is None:
-                    continue
-                fr = (
-                    b.latest()
-                    if live_display
-                    else b.frame_at_delay(display_delay_sec)
-                )
-                if fr is not None:
-                    frames_data.append((sid, fr))
-
-            if registry.is_continuous_recording():
-                row_stack = [fr for _sid, fr in frames_data]
-                stacked = build_vertical_stack(row_stack)
-                sess = registry.get_continuous_session_ts()
-                if cont_stack_bound_session is not None and sess != cont_stack_bound_session:
-                    close_continuous_stack_writer()
-                if stacked is not None:
-                    sh, sw = stacked.shape[:2]
-                    if cont_stack_writer is None:
-                        os.makedirs("./video", exist_ok=True)
-                        if ffmpeg_io.ffmpeg_available():
-                            cont_stack_path = f"./video/cont_stack_{sess}.mp4"
-                            cont_stack_writer = ffmpeg_io.FfmpegBGRWriter(
-                                cont_stack_path, sw, sh, frame_rate
-                            )
-                            cont_stack_bound_session = sess
-                            print(
-                                f"[cont_stack] REC empilé (H.264) → {cont_stack_path}"
-                            )
-                        else:
-                            cont_stack_path = f"./video/cont_stack_{sess}.avi"
-                            cont_stack_writer = cv2.VideoWriter(
-                                cont_stack_path,
-                                cv2.VideoWriter_fourcc(*"XVID"),
-                                max(1, frame_rate),
-                                (sw, sh),
-                            )
-                            if not cont_stack_writer.isOpened():
-                                print(
-                                    f"[cont_stack] Impossible d’ouvrir {cont_stack_path}"
-                                )
-                                cont_stack_writer = None
-                                cont_stack_path = None
-                            else:
-                                cont_stack_bound_session = sess
-                                print(
-                                    f"[cont_stack] REC empilé (AVI) → {cont_stack_path}"
-                                )
-                    if cont_stack_writer is not None:
-                        cont_stack_writer.write(stacked)
 
             n = max(1, len(frames_data))
             cols = max(1, math.ceil(math.sqrt(n)))
