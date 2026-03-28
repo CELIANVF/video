@@ -86,6 +86,8 @@ python main.py --log-json --log-level INFO
 
 Le serveur détecte automatiquement legacy / V2 après l’en-tête `CAMERA` (voir [`video_app/protocol.py`](video_app/protocol.py)).
 
+Chaque **nom de flux** (`CAMERA <nom>` / `--name`) doit être **unique** parmi les flux connectés : si un second client utilise le même nom, la connexion est refusée avec la ligne `ERROR duplicate_stream_id` (sinon les deux sources écriraient dans le même tampon et l’image serait incohérente).
+
 ## Structure du dépôt
 
 - `main.py` — point d’entrée serveur

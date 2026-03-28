@@ -86,6 +86,22 @@ class StreamRegistry:
                 self._streams[stream_id] = b
             return self._streams[stream_id]
 
+    def add_stream_if_absent(self, stream_id: str) -> StreamBuffer | None:
+        """Crée le tampon si l’id est libre ; sinon None (évite deux caméras sur le même nom)."""
+        with self._lock:
+            if stream_id in self._streams:
+                return None
+            b = StreamBuffer(
+                stream_id,
+                self.frame_rate,
+                self.buffer_duration,
+                export_dir=self.export_dir,
+            )
+            if self._continuous_active:
+                b.start_continuous(self._continuous_session_ts)
+            self._streams[stream_id] = b
+            return b
+
     def remove(self, stream_id: str) -> None:
         with self._lock:
             b = self._streams.pop(stream_id, None)
@@ -277,7 +293,25 @@ def _client_loop(
         log(f"client {addr}: en-tête invalide ({e})")
         return
 
-    buf = registry.get_or_create(stream_id)
+    buf = registry.add_stream_if_absent(stream_id)
+    if buf is None:
+        log(
+            f"flux {stream_id}: connexion refusée depuis {addr} "
+            f"(identifiant déjà utilisé par un autre flux — changez --name)"
+        )
+        try:
+            conn.sendall(
+                "ERROR duplicate_stream_id\n".encode("utf-8", errors="replace")
+            )
+        except OSError:
+            pass
+        try:
+            conn.shutdown(socket.SHUT_RDWR)
+        except OSError:
+            pass
+        conn.close()
+        return
+
     log(f"flux connecté: {stream_id} depuis {addr}")
     recv_thread: threading.Thread | None = None
     dispatch_thread: threading.Thread | None = None
@@ -431,14 +465,21 @@ def _local_camera_loop(
     stop_event: threading.Event,
     log: Callable[[str], None],
 ) -> None:
+    buf = registry.add_stream_if_absent(stream_id)
+    if buf is None:
+        log(
+            f"caméra locale {stream_id}: identifiant déjà utilisé "
+            f"(autre flux ou --local en double)"
+        )
+        return
     cap = cv2.VideoCapture(device)
     if not cap.isOpened():
+        registry.remove(stream_id)
         log(f"caméra locale {stream_id}: impossible d’ouvrir {device!r}")
         return
     ew, eh, _ = configure_webcam_best_effort(
         cap, apply_resolution=True, apply_fps=True
     )
-    buf = registry.get_or_create(stream_id)
     dim = f"{ew}×{eh} px" if ew > 0 and eh > 0 else "résolution inconnue"
     log(f"caméra locale {stream_id} ({device}) — {dim}")
     try:

@@ -10,6 +10,7 @@ from __future__ import annotations
 import argparse
 import logging
 import queue
+import select
 import socket
 import sys
 import threading
@@ -172,6 +173,35 @@ def _open_audio_input_stream(
     ) from last_err
 
 
+def _server_rejected_duplicate_name(sock: socket.socket, log: logging.Logger) -> bool:
+    """
+    Après CAMERA, le serveur peut répondre ERROR duplicate_stream_id si le nom est déjà pris.
+    Attente courte puis lecture non bloquante d’une ligne.
+    """
+    r, _, _ = select.select([sock], [], [], 0.25)
+    if not r:
+        return False
+    buf = bytearray()
+    try:
+        while len(buf) < 512:
+            chunk = sock.recv(1)
+            if not chunk:
+                break
+            buf.extend(chunk)
+            if buf.endswith(b"\n"):
+                break
+    except OSError:
+        return False
+    line = bytes(buf).decode("utf-8", errors="replace").strip()
+    if line.startswith("ERROR"):
+        log.error(
+            "%s — un autre flux utilise déjà ce nom ; choisissez un --name différent.",
+            line,
+        )
+        return True
+    return False
+
+
 def _run_one_socket_session(
     sock: socket.socket,
     cap: cv2.VideoCapture,
@@ -186,6 +216,8 @@ def _run_one_socket_session(
     Retour : 'stop' (ne pas reconnect), 'reconnect' (perte connexion).
     """
     send_camera_header(sock, args.name)
+    if _server_rejected_duplicate_name(sock, log):
+        return "stop"
     if args.audio and audio_stream is not None:
         sr = int(getattr(audio_stream, "samplerate", 48000))
         send_v2_header(sock, True, sample_rate=sr, channels=args.audio_channels)
