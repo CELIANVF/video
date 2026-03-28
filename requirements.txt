@@ -6,3 +6,4 @@ sounddevice>=0.4
 PyQt6>=6.5
 # 2.x exige libjpeg-turbo ≥3 (paquets Ubuntu = 2.x) ; 1.x fonctionne avec libturbojpeg0.
 PyTurboJPEG>=1.7,<2
+prometheus_client>=0.19

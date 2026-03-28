@@ -1,0 +1,39 @@
+# Copier vers video.toml et adapter.
+
+[server]
+host = "0.0.0.0"
+port = 8765
+frame_rate = 30
+buffer_duration = 5
+
+[paths]
+export_dir = "./video"
+
+[gui]
+# true = fenêtre PyQt6 avec boutons ; false = une seule fenêtre OpenCV (Touches: m r s q …)
+enabled = true
+stream_labels = { cam1 = "Entrée", cam2 = "Parking" }
+stream_order = [ "cam1", "cam2" ]
+
+[logging]
+level = "INFO"
+json = false
+
+[metrics]
+enabled = false
+host = "127.0.0.1"
+port = 9090
+
+[web]
+enabled = false
+host = "127.0.0.1"
+port = 8080
+# path_prefix = "/view"
+
+# Hôte du serveur pour camera.py --config (section séparée : ne pas laisser host/port sous [web])
+[client]
+host = "192.168.1.35"
+port = 8765
+# Résolution d’envoi JPEG (0 = taille native) — équivalent à --width / --height
+width = 1920
+height = 1080

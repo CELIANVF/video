@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import os
 import threading
 import time
@@ -11,6 +12,8 @@ from typing import Any
 import cv2
 
 from video_app import ffmpeg_io
+
+logger = logging.getLogger(__name__)
 
 
 def _max_deque_len(buffer_seconds: int) -> int:
@@ -33,10 +36,18 @@ def effective_fps_from_timestamps(
 
 
 class StreamBuffer:
-    def __init__(self, stream_id: str, frame_rate: int, buffer_duration: int):
+    def __init__(
+        self,
+        stream_id: str,
+        frame_rate: int,
+        buffer_duration: int,
+        *,
+        export_dir: str = "./video",
+    ):
         self.stream_id = stream_id
         self.frame_rate = max(1, frame_rate)
         self._buffer_duration = max(1, buffer_duration)
+        self.export_dir = export_dir.rstrip("/") or "."
         self._lock = threading.Lock()
         self._frames: deque = deque(maxlen=_max_deque_len(self._buffer_duration))
         self._continuous = False
@@ -79,7 +90,7 @@ class StreamBuffer:
                 and self._cont_stem
                 and self._pcm_file is None
             ):
-                os.makedirs("./video", exist_ok=True)
+                os.makedirs(self.export_dir, exist_ok=True)
                 self._pcm_file = open(f"{self._cont_stem}._a.pcm", "wb")
 
     def _open_pcm_if_needed_unlocked(self) -> None:
@@ -87,7 +98,7 @@ class StreamBuffer:
             return
         if self._audio_sr is None:
             return
-        os.makedirs("./video", exist_ok=True)
+        os.makedirs(self.export_dir, exist_ok=True)
         self._pcm_file = open(f"{self._cont_stem}._a.pcm", "wb")
 
     def _ensure_opencv_warmup_flushed_unlocked(self) -> None:
@@ -117,16 +128,19 @@ class StreamBuffer:
             (w, h),
         )
         if not self._cont_writer.isOpened():
-            print(
-                f"[{self.stream_id}] REC OpenCV : impossible d’ouvrir "
-                f"{self._cont_video_temp}"
+            logger.warning(
+                "[%s] REC OpenCV : impossible d’ouvrir %s",
+                self.stream_id,
+                self._cont_video_temp,
             )
             self._cont_writer = None
             self._opencv_warmup_frames.clear()
             return
-        print(
-            f"[{self.stream_id}] REC OpenCV AVI (~{fps_eff:.1f} img/s réelles, "
-            f"pas {self.frame_rate} Hz serveur)"
+        logger.info(
+            "[%s] REC OpenCV AVI (~%.1f img/s réelles, pas %s Hz serveur)",
+            self.stream_id,
+            fps_eff,
+            self.frame_rate,
         )
         for f, ts in self._opencv_warmup_frames:
             if self._cont_frame_count == 0:
@@ -143,9 +157,10 @@ class StreamBuffer:
             else:
                 code, err = self._cont_writer.close()
                 if code != 0 and err:
-                    print(
-                        f"[{self.stream_id}] ffmpeg fin anormale: "
-                        f"{err.decode(errors='replace')[:300]}"
+                    logger.warning(
+                        "[%s] ffmpeg fin anormale: %s",
+                        self.stream_id,
+                        err.decode(errors="replace")[:300],
                     )
             self._cont_writer = None
         self._cont_path = None
@@ -204,7 +219,11 @@ class StreamBuffer:
                     os.remove(pcm)
                 except OSError:
                     pass
-                print(f"[{self.stream_id}] Enregistrement continu terminé (vidéo+audio) : {out_mp4}")
+                logger.info(
+                    "[%s] Enregistrement continu terminé (vidéo+audio) : %s",
+                    self.stream_id,
+                    out_mp4,
+                )
                 self._cont_stem = None
                 return
         try:
@@ -219,9 +238,15 @@ class StreamBuffer:
                     os.remove(pcm)
                 except OSError:
                     pass
-            print(f"[{self.stream_id}] Enregistrement continu terminé : {final}")
+            logger.info(
+                "[%s] Enregistrement continu terminé : %s", self.stream_id, final
+            )
         except OSError as e:
-            print(f"[{self.stream_id}] Impossible de finaliser l’enregistrement : {e}")
+            logger.warning(
+                "[%s] Impossible de finaliser l’enregistrement : %s",
+                self.stream_id,
+                e,
+            )
         self._cont_stem = None
 
     def _write_continuous_frame_unlocked(self, fr) -> None:
@@ -238,13 +263,18 @@ class StreamBuffer:
                         self._cont_video_temp, w, h, self.frame_rate
                     )
                 except (RuntimeError, OSError) as e:
-                    print(f"[{self.stream_id}] ffmpeg pipe indisponible ({e}), repli OpenCV")
+                    logger.warning(
+                        "[%s] ffmpeg pipe indisponible (%s), repli OpenCV",
+                        self.stream_id,
+                        e,
+                    )
                     self._cont_writer = None
                 else:
                     self._cont_path = self._cont_video_temp
-                    print(
-                        f"[{self.stream_id}] REC continu → {self._cont_stem}.mp4 "
-                        "(H.264, Android)"
+                    logger.info(
+                        "[%s] REC continu → %s.mp4 (H.264, Android)",
+                        self.stream_id,
+                        self._cont_stem,
                     )
             if self._cont_writer is None:
                 self._opencv_warmup_frames.append((fr.copy(), time.time()))
@@ -266,17 +296,20 @@ class StreamBuffer:
                 )
                 self._cont_path = self._cont_video_temp
                 if not self._cont_writer.isOpened():
-                    print(
-                        f"[{self.stream_id}] REC continu : impossible d’ouvrir "
-                        f"{self._cont_video_temp}"
+                    logger.warning(
+                        "[%s] REC continu : impossible d’ouvrir %s",
+                        self.stream_id,
+                        self._cont_video_temp,
                     )
                     self._continuous = False
                     self._cont_writer = None
                     self._opencv_warmup_frames.clear()
                     return
-                print(
-                    f"[{self.stream_id}] REC continu → {self._cont_stem}.avi "
-                    f"(OpenCV ~{fps_eff:.1f} img/s)"
+                logger.info(
+                    "[%s] REC continu → %s.avi (OpenCV ~%.1f img/s)",
+                    self.stream_id,
+                    self._cont_stem,
+                    fps_eff,
                 )
                 for f, ts in self._opencv_warmup_frames:
                     if self._cont_frame_count == 0:
@@ -300,8 +333,10 @@ class StreamBuffer:
             self._finalize_continuous_unlocked()
             self._continuous = True
             self._cont_session_ts = session_ts
-            os.makedirs("./video", exist_ok=True)
-            self._cont_stem = f"./video/cont_{self.stream_id}_{session_ts}"
+            os.makedirs(self.export_dir, exist_ok=True)
+            self._cont_stem = os.path.join(
+                self.export_dir, f"cont_{self.stream_id}_{session_ts}"
+            )
             self._cont_writer = None
             self._cont_path = None
             self._cont_video_temp = None
@@ -355,6 +390,35 @@ class StreamBuffer:
             self._trim_to_duration_unlocked(time.time())
             return self._frames[-1][1] if self._frames else None
 
+    def latest_with_ts(self) -> tuple[Any, float | None]:
+        with self._lock:
+            self._trim_to_duration_unlocked(time.time())
+            if not self._frames:
+                return None, None
+            ts, fr = self._frames[-1]
+            return fr, ts
+
+    def frame_at_delay_with_ts(self, delay_sec: float) -> tuple[Any, float | None]:
+        if delay_sec <= 0:
+            return self.latest_with_ts()
+        target = time.time() - delay_sec
+        with self._lock:
+            self._trim_to_duration_unlocked(time.time())
+            if not self._frames:
+                return None, None
+            chosen_fr = None
+            chosen_ts: float | None = None
+            for ts, fr in self._frames:
+                if ts <= target:
+                    chosen_fr = fr
+                    chosen_ts = ts
+                else:
+                    break
+            if chosen_fr is not None:
+                return chosen_fr, chosen_ts
+            ts0, fr0 = self._frames[0]
+            return fr0, ts0
+
     def measured_input_fps(self) -> float:
         """Débit moyen d’images reçues (sur la fenêtre du tampon temporel)."""
         with self._lock:
@@ -390,34 +454,104 @@ class StreamBuffer:
     def save_last_seconds(self) -> str | None:
         timed = self.snapshot_timed()
         if not timed:
-            print(f"[{self.stream_id}] Aucune image à enregistrer.")
+            logger.info("[%s] Aucune image à enregistrer.", self.stream_id)
             return None
         frames = [fr for _, fr in timed]
         times = [t for t, _ in timed]
         fps = effective_fps_from_timestamps(times, float(self.frame_rate))
         h, w = frames[0].shape[:2]
         if w == 0 or h == 0:
-            print(f"[{self.stream_id}] Dimensions invalides.")
+            logger.warning("[%s] Dimensions invalides.", self.stream_id)
             return None
-        os.makedirs("./video", exist_ok=True)
+        os.makedirs(self.export_dir, exist_ok=True)
         ts = int(time.time())
         if ffmpeg_io.ffmpeg_available():
-            path = f"./video/{self.stream_id}_{ts}.mp4"
+            path = os.path.join(self.export_dir, f"{self.stream_id}_{ts}.mp4")
             if ffmpeg_io.write_frames_bgr_to_mp4(
                 path, frames, fps, self.stream_id
             ):
                 return path
-        path = f"./video/{self.stream_id}_{ts}.avi"
+        path = os.path.join(self.export_dir, f"{self.stream_id}_{ts}.avi")
         writer = cv2.VideoWriter(
             path, cv2.VideoWriter_fourcc(*"XVID"), fps, (w, h)
         )
         if not writer.isOpened():
-            print(f"[{self.stream_id}] Impossible d’ouvrir le writer pour {path}.")
+            logger.warning(
+                "[%s] Impossible d’ouvrir le writer pour %s.", self.stream_id, path
+            )
             return None
         try:
             for f in frames:
                 writer.write(f)
         finally:
             writer.release()
-        print(f"[{self.stream_id}] Vidéo enregistrée : {path}")
+        logger.info("[%s] Vidéo enregistrée : %s", self.stream_id, path)
+        return path
+
+    def timed_frames_since(self, seconds: float) -> list[tuple[float, Any]]:
+        now = time.time()
+        cutoff = now - max(0.01, float(seconds))
+        with self._lock:
+            self._trim_to_duration_unlocked(now)
+            return [(t, f) for t, f in self._frames if t >= cutoff]
+
+    def save_clip_last_seconds(self, seconds: float) -> str | None:
+        timed = self.timed_frames_since(seconds)
+        if not timed:
+            logger.info(
+                "[%s] Aucune image pour les %g dernières secondes.",
+                self.stream_id,
+                seconds,
+            )
+            return None
+        frames = [fr for _, fr in timed]
+        times = [t for t, _ in timed]
+        fps = effective_fps_from_timestamps(times, float(self.frame_rate))
+        h, w = frames[0].shape[:2]
+        if w == 0 or h == 0:
+            logger.warning("[%s] Dimensions invalides.", self.stream_id)
+            return None
+        snap = os.path.join(self.export_dir, "clips")
+        os.makedirs(snap, exist_ok=True)
+        ts = int(time.time())
+        if ffmpeg_io.ffmpeg_available():
+            path = os.path.join(snap, f"{self.stream_id}_clip{int(seconds)}s_{ts}.mp4")
+            if ffmpeg_io.write_frames_bgr_to_mp4(
+                path, frames, fps, self.stream_id
+            ):
+                logger.info("[%s] Clip enregistré : %s", self.stream_id, path)
+                return path
+        path = os.path.join(snap, f"{self.stream_id}_clip{int(seconds)}s_{ts}.avi")
+        writer = cv2.VideoWriter(
+            path, cv2.VideoWriter_fourcc(*"XVID"), fps, (w, h)
+        )
+        if not writer.isOpened():
+            logger.warning(
+                "[%s] Impossible d’ouvrir le writer pour %s.", self.stream_id, path
+            )
+            return None
+        try:
+            for f in frames:
+                writer.write(f)
+        finally:
+            writer.release()
+        logger.info("[%s] Clip enregistré : %s", self.stream_id, path)
+        return path
+
+    def save_latest_png(self) -> str | None:
+        with self._lock:
+            self._trim_to_duration_unlocked(time.time())
+            if not self._frames:
+                logger.info("[%s] Aucune image pour snapshot PNG.", self.stream_id)
+                return None
+            _, fr = self._frames[-1]
+            img = fr.copy()
+        snap = os.path.join(self.export_dir, "snapshots")
+        os.makedirs(snap, exist_ok=True)
+        ts = int(time.time())
+        path = os.path.join(snap, f"{self.stream_id}_{ts}.png")
+        if not cv2.imwrite(path, img):
+            logger.warning("[%s] Échec écriture %s", self.stream_id, path)
+            return None
+        logger.info("[%s] PNG : %s", self.stream_id, path)
         return path

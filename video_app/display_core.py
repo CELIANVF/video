@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import os
 import time
 from typing import Any
@@ -11,13 +12,33 @@ import cv2
 from video_app import ffmpeg_io
 from video_app.export_video import build_vertical_stack
 
+logger = logging.getLogger(__name__)
+
+
+def ordered_stream_ids(registry: Any, stream_order: list[str] | None) -> list[str]:
+    raw = list(registry.ids())
+    if not stream_order:
+        return raw
+    seen: set[str] = set()
+    out: list[str] = []
+    for sid in stream_order:
+        if sid in raw and sid not in seen:
+            out.append(sid)
+            seen.add(sid)
+    for sid in raw:
+        if sid not in seen:
+            out.append(sid)
+            seen.add(sid)
+    return out
+
 
 def gather_display_frames(
     registry: Any,
     live_display: bool,
     display_delay_sec: float,
+    stream_order: list[str] | None = None,
 ) -> list[tuple[str, Any]]:
-    ids = registry.ids()
+    ids = ordered_stream_ids(registry, stream_order)
     out: list[tuple[str, Any]] = []
     for sid in ids:
         b = registry.get(sid)
@@ -30,6 +51,27 @@ def gather_display_frames(
         )
         if fr is not None:
             out.append((sid, fr))
+    return out
+
+
+def gather_display_frames_with_ts(
+    registry: Any,
+    live_display: bool,
+    display_delay_sec: float,
+    stream_order: list[str] | None = None,
+) -> list[tuple[str, Any, float | None]]:
+    ids = ordered_stream_ids(registry, stream_order)
+    out: list[tuple[str, Any, float | None]] = []
+    for sid in ids:
+        b = registry.get(sid)
+        if b is None:
+            continue
+        if live_display:
+            fr, ts = b.latest_with_ts()
+        else:
+            fr, ts = b.frame_at_delay_with_ts(display_delay_sec)
+        if fr is not None:
+            out.append((sid, fr, ts))
     return out
 
 
@@ -47,8 +89,8 @@ def close_continuous_stack_state(state: dict[str, Any]) -> None:
         else:
             code, err = w.close()
             if code != 0 and err:
-                print(
-                    "[cont_stack] ffmpeg :",
+                logger.warning(
+                    "[cont_stack] ffmpeg : %s",
                     err.decode(errors="replace")[:200],
                 )
     state["writer"] = None
@@ -71,7 +113,7 @@ def close_continuous_stack_state(state: dict[str, Any]) -> None:
         )
 
     if final and os.path.isfile(final):
-        print(f"[cont_stack] Fichier terminé : {final}")
+        logger.info("[cont_stack] Fichier terminé : %s", final)
 
     state["path"] = None
     state["bound_session"] = None
@@ -86,6 +128,7 @@ def tick_continuous_stack_recording(
     frames_data: list[tuple[str, Any]],
     frame_rate: int,
     state: dict,
+    export_dir: str = "./video",
 ) -> None:
     if not registry.is_continuous_recording():
         return
@@ -98,9 +141,10 @@ def tick_continuous_stack_recording(
         return
     sh, sw = stacked.shape[:2]
     if state.get("writer") is None:
-        os.makedirs("./video", exist_ok=True)
+        ed = export_dir.rstrip("/") or "."
+        os.makedirs(ed, exist_ok=True)
         if ffmpeg_io.ffmpeg_available():
-            path = f"./video/cont_stack_{sess}.mp4"
+            path = os.path.join(ed, f"cont_stack_{sess}.mp4")
             state["writer"] = ffmpeg_io.FfmpegBGRWriter(
                 path, sw, sh, frame_rate
             )
@@ -109,9 +153,9 @@ def tick_continuous_stack_recording(
             state["stack_frame_count"] = 0
             state["stack_wall_start"] = None
             state["stack_wall_last"] = None
-            print(f"[cont_stack] REC empilé (H.264) → {path}")
+            logger.info("[cont_stack] REC empilé (H.264) → %s", path)
         else:
-            path = f"./video/cont_stack_{sess}.avi"
+            path = os.path.join(ed, f"cont_stack_{sess}.avi")
             writer = cv2.VideoWriter(
                 path,
                 cv2.VideoWriter_fourcc(*"XVID"),
@@ -119,7 +163,7 @@ def tick_continuous_stack_recording(
                 (sw, sh),
             )
             if not writer.isOpened():
-                print(f"[cont_stack] Impossible d’ouvrir {path}")
+                logger.warning("[cont_stack] Impossible d’ouvrir %s", path)
                 state["writer"] = None
                 state["path"] = None
                 return
@@ -129,7 +173,7 @@ def tick_continuous_stack_recording(
             state["stack_frame_count"] = 0
             state["stack_wall_start"] = None
             state["stack_wall_last"] = None
-            print(f"[cont_stack] REC empilé (AVI) → {path}")
+            logger.info("[cont_stack] REC empilé (AVI) → %s", path)
     writer = state.get("writer")
     if writer is not None:
         now = time.time()

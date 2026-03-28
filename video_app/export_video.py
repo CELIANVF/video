@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import os
 import time
 from typing import Any
@@ -12,20 +13,23 @@ import numpy as np
 from video_app import ffmpeg_io
 from video_app.buffer import StreamBuffer, effective_fps_from_timestamps
 
+logger = logging.getLogger(__name__)
+
 
 def _write_video_file(path: str, frames: list, fps: float, label: str) -> bool:
     if not frames:
-        print(f"[{label}] Aucune image à enregistrer.")
+        logger.info("[%s] Aucune image à enregistrer.", label)
         return False
     h, w = frames[0].shape[:2]
     if w == 0 or h == 0:
-        print(f"[{label}] Dimensions invalides.")
+        logger.warning("[%s] Dimensions invalides.", label)
         return False
-    os.makedirs("./video", exist_ok=True)
+    base = os.path.dirname(path) or "."
+    os.makedirs(base, exist_ok=True)
     if path.endswith(".mp4") and ffmpeg_io.ffmpeg_available():
         if ffmpeg_io.write_frames_bgr_to_mp4(path, frames, fps, label):
             return True
-        print(f"[{label}] MP4 ffmpeg a échoué, repli AVI")
+        logger.warning("[%s] MP4 ffmpeg a échoué, repli AVI", label)
         path = path[:-4] + ".avi"
     elif path.endswith(".mp4"):
         path = path[:-4] + ".avi"
@@ -33,14 +37,14 @@ def _write_video_file(path: str, frames: list, fps: float, label: str) -> bool:
         path, cv2.VideoWriter_fourcc(*"XVID"), float(max(1.0, fps)), (w, h)
     )
     if not writer.isOpened():
-        print(f"[{label}] Impossible d’ouvrir le writer pour {path}.")
+        logger.warning("[%s] Impossible d’ouvrir le writer pour %s.", label, path)
         return False
     try:
         for f in frames:
             writer.write(f)
     finally:
         writer.release()
-    print(f"[{label}] Vidéo enregistrée : {path}")
+    logger.info("[%s] Vidéo enregistrée : %s", label, path)
     return True
 
 
@@ -69,11 +73,19 @@ def save_per_stream_and_stack(
     buffers: list[StreamBuffer],
     frame_rate: int,
     ts: int | None = None,
+    export_dir: str | None = None,
 ) -> None:
     """
     Ordre des `buffers` = ordre d’affichage : premier = bandeau du haut (flux 0), etc.
     """
     ts = ts if ts is not None else int(time.time())
+    ed = export_dir
+    if ed is None and buffers:
+        ed = buffers[0].export_dir
+    if ed is None:
+        ed = "./video"
+    ed = ed.rstrip("/") or "."
+    os.makedirs(ed, exist_ok=True)
     ext = ".mp4" if ffmpeg_io.ffmpeg_available() else ".avi"
     fb = float(frame_rate)
     snapshots: list[tuple[str, list[tuple[float, Any]]]] = [
@@ -82,18 +94,18 @@ def save_per_stream_and_stack(
 
     for stream_id, timed in snapshots:
         if not timed:
-            print(f"[{stream_id}] Aucune image à enregistrer.")
+            logger.info("[%s] Aucune image à enregistrer.", stream_id)
             continue
         frames = [fr for _, fr in timed]
         times = [t for t, _ in timed]
         fps = effective_fps_from_timestamps(times, fb)
-        path = f"./video/{stream_id}_{ts}{ext}"
+        path = os.path.join(ed, f"{stream_id}_{ts}{ext}")
         _write_video_file(path, frames, fps, stream_id)
 
     non_empty = [(sid, t) for sid, t in snapshots if t]
     if len(non_empty) < 2:
         if len(non_empty) == 1:
-            print(
+            logger.info(
                 "[stack] Un seul flux actif : pas de vidéo empilée "
                 "(inutile, la vidéo par flux suffit)."
             )
@@ -117,5 +129,5 @@ def save_per_stream_and_stack(
             )
     fps_stack = sum(fps_vals) / len(fps_vals) if fps_vals else fb
 
-    out = f"./video/stack_{ts}{ext}"
+    out = os.path.join(ed, f"stack_{ts}{ext}")
     _write_video_file(out, stacked_frames, fps_stack, "stack")

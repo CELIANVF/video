@@ -2,20 +2,42 @@
 
 from __future__ import annotations
 
+import logging
 import math
 import os
 import queue
 import socket
+import sys
 import threading
 import time
 from collections import OrderedDict
 from typing import Callable
+
+# OpenCV utilise un Qt embarqué ; sous Wayland il pointe souvent vers des plugins
+# absents dans site-packages/cv2/qt/plugins → forcer X11 si aucune config explicite.
+if sys.platform.startswith("linux") and "QT_QPA_PLATFORM" not in os.environ:
+    os.environ["QT_QPA_PLATFORM"] = "xcb"
+
+# Évite les avertissements répétés « Cannot find font directory …/cv2/qt/fonts »
+# en utilisant les polices système (DejaVu, etc.) si présentes.
+if sys.platform.startswith("linux") and "QT_QPA_FONTDIR" not in os.environ:
+    for _font_root in (
+        "/usr/share/fonts/truetype/dejavu",
+        "/usr/share/fonts/truetype/liberation",
+        "/usr/share/fonts/TTF",
+        "/usr/share/fonts/opentype/noto",
+        "/usr/share/fonts",
+    ):
+        if os.path.isdir(_font_root):
+            os.environ["QT_QPA_FONTDIR"] = _font_root
+            break
 
 import cv2
 import numpy as np
 import screeninfo
 
 from video_app import ffmpeg_io
+from video_app.logutil import setup_logging
 from video_app.buffer import StreamBuffer
 from video_app.capture import capture_resized, configure_webcam_best_effort
 from video_app.fast_jpeg import decode_jpeg_bgr, turbojpeg_available
@@ -36,11 +58,17 @@ from video_app.protocol import (
 
 
 class StreamRegistry:
-    def __init__(self, frame_rate: int, buffer_duration: int):
+    def __init__(
+        self,
+        frame_rate: int,
+        buffer_duration: int,
+        export_dir: str = "./video",
+    ):
         self._lock = threading.Lock()
         self._streams: OrderedDict[str, StreamBuffer] = OrderedDict()
         self.frame_rate = frame_rate
         self.buffer_duration = buffer_duration
+        self.export_dir = export_dir.rstrip("/") or "."
         self._continuous_active = False
         self._continuous_session_ts = 0
 
@@ -48,7 +76,10 @@ class StreamRegistry:
         with self._lock:
             if stream_id not in self._streams:
                 b = StreamBuffer(
-                    stream_id, self.frame_rate, self.buffer_duration
+                    stream_id,
+                    self.frame_rate,
+                    self.buffer_duration,
+                    export_dir=self.export_dir,
                 )
                 if self._continuous_active:
                     b.start_continuous(self._continuous_session_ts)
@@ -81,13 +112,18 @@ class StreamRegistry:
                 buf.start_continuous(session_ts)
             else:
                 buf.stop_continuous()
+        log = logging.getLogger("video_app.server")
         if active:
-            print(
-                f"[serveur] Enregistrement continu ACTIF "
-                f"(session {session_ts}) — touche r pour arrêter"
+            log.info(
+                "Enregistrement continu ACTIF (session %s) — touche r pour arrêter",
+                session_ts,
+                extra={"component": "serveur"},
             )
         else:
-            print("[serveur] Enregistrement continu désactivé")
+            log.info(
+                "Enregistrement continu désactivé",
+                extra={"component": "serveur"},
+            )
 
     def ids(self) -> list[str]:
         with self._lock:
@@ -170,6 +206,9 @@ class _StreamPacketMerger:
                 if fps_diag:
                     fps_diag.bump("append_v")
                 buf.append(video_out, copy_frame=False)
+                from video_app import metrics as _metrics
+
+                _metrics.bump_frame_appended(buf.stream_id)
 
 
 class _NetFpsDiag:
@@ -201,11 +240,17 @@ class _NetFpsDiag:
                 s = self._c.copy()
                 for k in self._c:
                     self._c[k] = 0
-            print(
-                f"[debug-fps serveur {self._label}] "
-                f"recv_pkt={s['recv_pkt']}/s vid={s['recv_vid']}/s aud={s['recv_aud']}/s | "
-                f"dispatch_vid={s['dispatch_vid']}/s decode={s['decode']}/s | "
-                f"append_vid={s['append_v']}/s append_aud={s['append_a']}/s"
+            logging.getLogger("video_app.server").info(
+                "[debug-fps serveur %s] recv_pkt=%s/s vid=%s/s aud=%s/s | "
+                "dispatch_vid=%s/s decode=%s/s | append_vid=%s/s append_aud=%s/s",
+                self._label,
+                s["recv_pkt"],
+                s["recv_vid"],
+                s["recv_aud"],
+                s["dispatch_vid"],
+                s["decode"],
+                s["append_v"],
+                s["append_a"],
             )
 
     def close(self) -> None:
@@ -219,6 +264,7 @@ def _client_loop(
     stop_event: threading.Event,
     log: Callable[[str], None],
     debug_fps: bool = False,
+    disconnect_notice: queue.SimpleQueue | None = None,
 ) -> None:
     stream_id = f"net_{addr[0]}_{addr[1]}"
     try:
@@ -281,6 +327,10 @@ def _client_loop(
                 fr = decode_jpeg_bgr(jpeg_b)
                 if fps_diag:
                     fps_diag.bump("decode")
+                if fr is None:
+                    from video_app import metrics as _metrics
+
+                    _metrics.bump_decode_error(stream_id)
                 merger.add_video(int(seq_j), fr)
 
         def _recv_legacy(jpeg0: bytes) -> None:
@@ -364,6 +414,11 @@ def _client_loop(
             wt.join(timeout=3.0)
         registry.remove(stream_id)
         log(f"flux déconnecté: {stream_id}")
+        if disconnect_notice is not None:
+            try:
+                disconnect_notice.put_nowait(stream_id)
+            except queue.Full:
+                pass
         conn.close()
 
 
@@ -443,13 +498,35 @@ def run_server(
     local_devices: list[tuple[str, int | str]] | None = None,
     gui: bool = False,
     debug_fps: bool = False,
+    export_dir: str = "./video",
+    stream_labels: dict[str, str] | None = None,
+    stream_order: list[str] | None = None,
+    log_level: str = "INFO",
+    log_json: bool = False,
+    metrics_enabled: bool = False,
+    metrics_host: str = "127.0.0.1",
+    metrics_port: int = 9090,
+    web_enabled: bool = False,
+    web_host: str = "127.0.0.1",
+    web_port: int = 8080,
+    web_path_prefix: str = "",
 ) -> None:
     """
     local_devices: liste de (stream_id, device) ex. [("local_0", 0)].
     """
+    setup_logging(log_level, log_json)
+    srv_log = logging.getLogger("video_app.server")
+
     local_devices = local_devices or []
     stop_event = threading.Event()
-    registry = StreamRegistry(frame_rate, buffer_duration)
+    ed = export_dir.rstrip("/") or "."
+    registry = StreamRegistry(frame_rate, buffer_duration, export_dir=ed)
+    stream_labels = stream_labels or {}
+    stream_order = stream_order or []
+    order_for_display = stream_order if stream_order else None
+    disconnect_notice: queue.SimpleQueue | None = (
+        queue.SimpleQueue() if gui else None
+    )
 
     try:
         mon = screeninfo.get_monitors()[0]
@@ -468,7 +545,7 @@ def run_server(
     server_sock.settimeout(0.5)
 
     def log(msg: str) -> None:
-        print(f"[serveur] {msg}")
+        srv_log.info("%s", msg, extra={"component": "serveur"})
 
     threads: list[threading.Thread] = []
 
@@ -492,7 +569,15 @@ def run_server(
             conn.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
             t = threading.Thread(
                 target=_client_loop,
-                args=(conn, addr, registry, stop_event, log, debug_fps),
+                args=(
+                    conn,
+                    addr,
+                    registry,
+                    stop_event,
+                    log,
+                    debug_fps,
+                    disconnect_notice,
+                ),
                 daemon=True,
             )
             t.start()
@@ -500,6 +585,24 @@ def run_server(
     accept_thread = threading.Thread(target=accept_loop, daemon=True)
     accept_thread.start()
     log(f"écoute sur {host}:{port} — lancez camera.py sur les machines caméra")
+
+    if metrics_enabled:
+        from video_app import metrics as prom
+
+        prom.start_metrics_server(metrics_host, metrics_port)
+        prom.metrics_loop_thread(registry, stop_event)
+
+    if web_enabled:
+        from video_app.web_mjpeg import start_web_server
+
+        try:
+            start_web_server(web_host, web_port, registry, web_path_prefix)
+            log(
+                f"interface web MJPEG sur http://{web_host}:{web_port}"
+                f"{web_path_prefix or ''}/"
+            )
+        except OSError as e:
+            srv_log.error("serveur web : %s", e)
     if not ffmpeg_io.ffmpeg_available():
         log(
             "ffmpeg introuvable (PATH ou « pip install imageio-ffmpeg ») : "
@@ -521,9 +624,9 @@ def run_server(
         try:
             from video_app.qt_gui import run_qt_application
         except ImportError as e:
-            print(
-                "Interface graphique indisponible. Installez PyQt6 : pip install PyQt6\n"
-                f"({e})"
+            srv_log.error(
+                "Interface graphique indisponible. Installez PyQt6 : pip install PyQt6 (%s)",
+                e,
             )
         else:
 
@@ -543,6 +646,10 @@ def run_server(
                     stop_event=stop_event,
                     stack_state=stack_state,
                     on_shutdown=_shutdown_socket,
+                    export_dir=ed,
+                    stream_labels=stream_labels,
+                    stream_order=stream_order,
+                    disconnect_notice=disconnect_notice,
                 )
             finally:
                 close_continuous_stack_writer()
@@ -561,10 +668,13 @@ def run_server(
         while True:
             loop_start = time.time()
             frames_data = gather_display_frames(
-                registry, live_display, display_delay_sec
+                registry,
+                live_display,
+                display_delay_sec,
+                stream_order=order_for_display,
             )
             tick_continuous_stack_recording(
-                registry, frames_data, frame_rate, stack_state
+                registry, frames_data, frame_rate, stack_state, export_dir=ed
             )
             ids = registry.ids()
 
@@ -647,7 +757,7 @@ def run_server(
 
             real_fps_count += 1
             if time.time() - last_fps_time >= 1.0:
-                print(f"FPS affichage: {real_fps_count}")
+                srv_log.debug("FPS affichage: %s", real_fps_count)
                 real_fps_count = 0
                 last_fps_time = time.time()
 
@@ -675,7 +785,7 @@ def run_server(
                     fps = frame_rate
 
                     def _save_all() -> None:
-                        save_per_stream_and_stack(to_save, fps)
+                        save_per_stream_and_stack(to_save, fps, export_dir=ed)
 
                     threading.Thread(target=_save_all, daemon=True).start()
             elif key == ord("m"):
