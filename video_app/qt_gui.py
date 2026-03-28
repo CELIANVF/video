@@ -578,11 +578,13 @@ class ServerMainWindow(QMainWindow):
         self._drain_disconnect_toasts()
 
         delay = float(self.spin_delay.value())
+        raw_ids = list(self.registry.ids())
         frames = gather_display_frames_with_ts(
             self.registry,
             self.live_display,
             delay,
             stream_order=self._order_for_display(),
+            active_stream_ids=raw_ids,
         )
         tick_continuous_stack_recording(
             self.registry,
@@ -592,7 +594,7 @@ class ServerMainWindow(QMainWindow):
             export_dir=self._export_dir,
         )
 
-        ids = set(self.registry.ids())
+        ids = set(raw_ids)
 
         for sid in list(self._tiles.keys()):
             if sid not in ids:
@@ -606,7 +608,7 @@ class ServerMainWindow(QMainWindow):
                 w.close()
                 w.deleteLater()
 
-        for sid in self.registry.ids():
+        for sid in raw_ids:
             if sid in self._detached or sid in self._tiles:
                 continue
             self._tiles[sid] = StreamTile(sid, self)

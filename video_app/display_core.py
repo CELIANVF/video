@@ -15,8 +15,10 @@ from video_app.export_video import build_vertical_stack
 logger = logging.getLogger(__name__)
 
 
-def ordered_stream_ids(registry: Any, stream_order: list[str] | None) -> list[str]:
-    raw = list(registry.ids())
+def ordered_stream_ids_from_list(
+    raw_ids: list[str], stream_order: list[str] | None
+) -> list[str]:
+    raw = list(raw_ids)
     if not stream_order:
         return raw
     seen: set[str] = set()
@@ -32,13 +34,23 @@ def ordered_stream_ids(registry: Any, stream_order: list[str] | None) -> list[st
     return out
 
 
+def ordered_stream_ids(registry: Any, stream_order: list[str] | None) -> list[str]:
+    return ordered_stream_ids_from_list(list(registry.ids()), stream_order)
+
+
 def gather_display_frames(
     registry: Any,
     live_display: bool,
     display_delay_sec: float,
     stream_order: list[str] | None = None,
+    *,
+    active_stream_ids: list[str] | None = None,
 ) -> list[tuple[str, Any]]:
-    ids = ordered_stream_ids(registry, stream_order)
+    ids = (
+        ordered_stream_ids_from_list(active_stream_ids, stream_order)
+        if active_stream_ids is not None
+        else ordered_stream_ids(registry, stream_order)
+    )
     out: list[tuple[str, Any]] = []
     for sid in ids:
         b = registry.get(sid)
@@ -59,8 +71,14 @@ def gather_display_frames_with_ts(
     live_display: bool,
     display_delay_sec: float,
     stream_order: list[str] | None = None,
+    *,
+    active_stream_ids: list[str] | None = None,
 ) -> list[tuple[str, Any, float | None]]:
-    ids = ordered_stream_ids(registry, stream_order)
+    ids = (
+        ordered_stream_ids_from_list(active_stream_ids, stream_order)
+        if active_stream_ids is not None
+        else ordered_stream_ids(registry, stream_order)
+    )
     out: list[tuple[str, Any, float | None]] = []
     for sid in ids:
         b = registry.get(sid)

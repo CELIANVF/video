@@ -37,6 +37,7 @@ import numpy as np
 import screeninfo
 
 from video_app import ffmpeg_io
+from video_app import metrics as server_metrics
 from video_app.logutil import setup_logging
 from video_app.buffer import StreamBuffer
 from video_app.capture import capture_resized, configure_webcam_best_effort
@@ -50,8 +51,8 @@ from video_app.export_video import save_per_stream_and_stack
 from video_app.protocol import (
     PT_AUDIO,
     PT_VIDEO,
+    SockReader,
     peel_transport,
-    read_line,
     recv_jpeg_frame,
     recv_v2_packet,
 )
@@ -177,17 +178,17 @@ class _StreamPacketMerger:
     def add_audio(self, seq: int, pcm: bytes) -> None:
         with self._cv:
             self._audio[seq] = pcm
-            self._cv.notify_all()
+            self._cv.notify()
 
     def add_video(self, seq: int, frame: np.ndarray | None) -> None:
         with self._cv:
             self._video[seq] = frame
-            self._cv.notify_all()
+            self._cv.notify()
 
     def set_stream_end(self, max_seq: int) -> None:
         with self._cv:
             self._end_seq = max_seq
-            self._cv.notify_all()
+            self._cv.notify()
 
     def run(
         self,
@@ -222,9 +223,7 @@ class _StreamPacketMerger:
                 if fps_diag:
                     fps_diag.bump("append_v")
                 buf.append(video_out, copy_frame=False)
-                from video_app import metrics as _metrics
-
-                _metrics.bump_frame_appended(buf.stream_id)
+                server_metrics.bump_frame_appended(buf.stream_id)
 
 
 class _NetFpsDiag:
@@ -284,7 +283,8 @@ def _client_loop(
 ) -> None:
     stream_id = f"net_{addr[0]}_{addr[1]}"
     try:
-        line = read_line(conn)
+        reader = SockReader(conn)
+        line = reader.read_line()
         if line.upper().startswith("CAMERA "):
             name = line[7:].strip()
             if name:
@@ -318,7 +318,7 @@ def _client_loop(
     worker_threads: list[threading.Thread] = []
     fps_diag: _NetFpsDiag | None = None
     try:
-        mode, extra = peel_transport(conn)
+        mode, extra = peel_transport(reader)
         if debug_fps:
             fps_diag = _NetFpsDiag(stream_id)
         if not turbojpeg_available():
@@ -362,9 +362,7 @@ def _client_loop(
                 if fps_diag:
                     fps_diag.bump("decode")
                 if fr is None:
-                    from video_app import metrics as _metrics
-
-                    _metrics.bump_decode_error(stream_id)
+                    server_metrics.bump_decode_error(stream_id)
                 merger.add_video(int(seq_j), fr)
 
         def _recv_legacy(jpeg0: bytes) -> None:
@@ -376,7 +374,7 @@ def _client_loop(
                 ordered_q.put((1, PT_VIDEO, jpeg0))
                 seq = 2
                 while not stop_event.is_set():
-                    jpeg = recv_jpeg_frame(conn)
+                    jpeg = recv_jpeg_frame(reader)
                     if fps_diag:
                         fps_diag.bump("recv_pkt")
                         fps_diag.bump("recv_vid")
@@ -393,7 +391,7 @@ def _client_loop(
             try:
                 s = 1
                 while not stop_event.is_set():
-                    typ, data = recv_v2_packet(conn)
+                    typ, data = recv_v2_packet(reader)
                     if fps_diag:
                         fps_diag.bump("recv_pkt")
                         if typ == PT_VIDEO:
@@ -464,6 +462,7 @@ def _local_camera_loop(
     target_h: int,
     stop_event: threading.Event,
     log: Callable[[str], None],
+    target_period: float | None = None,
 ) -> None:
     buf = registry.add_stream_if_absent(stream_id)
     if buf is None:
@@ -484,29 +483,32 @@ def _local_camera_loop(
     log(f"caméra locale {stream_id} ({device}) — {dim}")
     try:
         while not stop_event.is_set():
+            t0 = time.time()
             frame = capture_resized(cap, target_w, target_h)
             if frame is not None:
                 buf.append(frame)
-            time.sleep(0.001)
+            if target_period is not None and target_period > 0:
+                elapsed = time.time() - t0
+                time.sleep(max(0.0, target_period - elapsed))
+            else:
+                time.sleep(0.001)
     finally:
         cap.release()
         registry.remove(stream_id)
         log(f"caméra locale arrêtée: {stream_id}")
 
 
-def _make_grid(
+def _fill_grid(
+    canvas: np.ndarray,
     frames: list[tuple[str, np.ndarray]],
     cell_w: int,
     cell_h: int,
-) -> np.ndarray | None:
-    if not frames:
-        return None
+) -> None:
+    canvas.fill(0)
     n = len(frames)
+    if n == 0:
+        return
     cols = max(1, math.ceil(math.sqrt(n)))
-    rows = math.ceil(n / cols)
-    grid_h = rows * cell_h
-    grid_w = cols * cell_w
-    canvas = np.zeros((grid_h, grid_w, 3), dtype=np.uint8)
     for i, (name, frame) in enumerate(frames):
         r, c = divmod(i, cols)
         if frame is None:
@@ -528,7 +530,6 @@ def _make_grid(
             1,
             cv2.LINE_AA,
         )
-    return canvas
 
 
 def run_server(
@@ -589,11 +590,21 @@ def run_server(
         srv_log.info("%s", msg, extra={"component": "serveur"})
 
     threads: list[threading.Thread] = []
+    local_period = 1.0 / max(1, int(frame_rate))
 
     for sid, dev in local_devices:
         t = threading.Thread(
             target=_local_camera_loop,
-            args=(dev, sid, registry, grid_max_w, grid_max_h, stop_event, log),
+            args=(
+                dev,
+                sid,
+                registry,
+                grid_max_w,
+                grid_max_h,
+                stop_event,
+                log,
+                local_period,
+            ),
             daemon=True,
         )
         t.start()
@@ -706,18 +717,20 @@ def run_server(
 
     try:
         window_sized = False
+        _display_cache: dict = {}
         while True:
             loop_start = time.time()
+            active_ids = registry.ids()
             frames_data = gather_display_frames(
                 registry,
                 live_display,
                 display_delay_sec,
                 stream_order=order_for_display,
+                active_stream_ids=active_ids,
             )
             tick_continuous_stack_recording(
                 registry, frames_data, frame_rate, stack_state, export_dir=ed
             )
-            ids = registry.ids()
 
             n = max(1, len(frames_data))
             cols = max(1, math.ceil(math.sqrt(n)))
@@ -725,8 +738,7 @@ def run_server(
             cell_w = max(160, grid_max_w // cols)
             cell_h = max(120, grid_max_h // rows)
 
-            grid = _make_grid(frames_data, cell_w, cell_h)
-            if grid is None:
+            if not frames_data:
                 grid = np.zeros((grid_max_h // 2, grid_max_w // 2, 3), dtype=np.uint8)
                 cv2.putText(
                     grid,
@@ -738,12 +750,23 @@ def run_server(
                     1,
                     cv2.LINE_AA,
                 )
+            else:
+                gh, gw = rows * cell_h, cols * cell_w
+                gkey = (gh, gw)
+                if _display_cache.get("grid_key") != gkey:
+                    _display_cache["grid"] = np.zeros((gh, gw, 3), dtype=np.uint8)
+                    _display_cache["grid_key"] = gkey
+                grid = _display_cache["grid"]
+                _fill_grid(grid, frames_data, cell_w, cell_h)
 
             hud_w = max(280, int(grid.shape[1] * 0.22))
-            hud = np.zeros((grid.shape[0], hud_w, 3), dtype=np.uint8)
-            wider = np.zeros((grid.shape[0], grid.shape[1] + hud_w, 3), dtype=np.uint8)
+            full_shape = (grid.shape[0], grid.shape[1] + hud_w, 3)
+            if _display_cache.get("wider_key") != full_shape:
+                _display_cache["wider"] = np.zeros(full_shape, dtype=np.uint8)
+                _display_cache["wider_key"] = full_shape
+            wider = _display_cache["wider"]
             wider[:, : grid.shape[1]] = grid
-            wider[:, grid.shape[1] :] = hud
+            wider[:, grid.shape[1] :].fill(0)
 
             mode_label = "LIVE" if live_display else f"DÉLAI {display_delay_sec:.0f}s"
             mode_color = (80, 255, 80) if live_display else (80, 180, 255)
@@ -772,7 +795,7 @@ def run_server(
             lines = [
                 f"FPS cible: {frame_rate}",
                 f"Tampon: {buffer_duration_live} s",
-                f"Flux actifs: {len(ids)}",
+                f"Flux actifs: {len(active_ids)}",
                 f"Affichage: {'direct' if live_display else 'retardé'}",
                 "",
                 "Touches:",

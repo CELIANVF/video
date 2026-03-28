@@ -1,23 +1,51 @@
 """Protocole TCP : ligne CAMERA puis JPEG (legacy) ou V2 (JPEG + PCM optionnel)."""
 
+from __future__ import annotations
+
+import socket
 import struct
 
 HEADER_MAX = 256
+_RECV_CHUNK = 65536
 
 PT_VIDEO = 1
 PT_AUDIO = 2
 
 
-def read_line(sock) -> str:
-    buf = bytearray()
-    while len(buf) < HEADER_MAX:
-        b = sock.recv(1)
-        if not b:
-            raise ConnectionError("connexion fermée pendant l’en-tête")
-        if b == b"\n":
-            return buf.decode("utf-8", errors="replace").strip()
-        buf.extend(b)
-    raise ValueError("ligne d’en-tête trop longue")
+class SockReader:
+    """Lecture TCP bufferisée (évite recv(1) répété sur les en-têtes)."""
+
+    __slots__ = ("_sock", "_b")
+
+    def __init__(self, sock: socket.socket) -> None:
+        self._sock = sock
+        self._b = bytearray()
+
+    def _recv_more(self) -> None:
+        data = self._sock.recv(_RECV_CHUNK)
+        if not data:
+            raise ConnectionError("fin de flux")
+        self._b.extend(data)
+
+    def read_exact(self, n: int) -> bytes:
+        while len(self._b) < n:
+            self._recv_more()
+        out = bytes(self._b[:n])
+        del self._b[:n]
+        return out
+
+    def read_line(self, max_len: int = HEADER_MAX) -> str:
+        while True:
+            nl = self._b.find(b"\n")
+            if nl >= 0:
+                if nl >= max_len:
+                    raise ValueError("ligne d'en-tête trop longue")
+                line = bytes(self._b[:nl])
+                del self._b[: nl + 1]
+                return line.decode("utf-8", errors="replace").strip()
+            if len(self._b) >= max_len:
+                raise ValueError("ligne d'en-tête trop longue")
+            self._recv_more()
 
 
 def send_camera_header(sock, name: str) -> None:
@@ -25,24 +53,12 @@ def send_camera_header(sock, name: str) -> None:
     sock.sendall(line)
 
 
-def recv_exact(sock, n: int) -> bytes:
-    chunks = []
-    remaining = n
-    while remaining:
-        data = sock.recv(remaining)
-        if not data:
-            raise ConnectionError("fin de flux")
-        chunks.append(data)
-        remaining -= len(data)
-    return b"".join(chunks)
-
-
-def recv_jpeg_frame(sock) -> bytes:
-    header = recv_exact(sock, 4)
+def recv_jpeg_frame(reader: SockReader) -> bytes:
+    header = reader.read_exact(4)
     (length,) = struct.unpack(">I", header)
     if length > 50 * 1024 * 1024:
         raise ValueError(f"trame JPEG anormalement grande: {length}")
-    return recv_exact(sock, length)
+    return reader.read_exact(length)
 
 
 def send_jpeg_frame(sock, jpeg: bytes) -> None:
@@ -61,45 +77,39 @@ def send_v2_packet(sock, packet_type: int, payload: bytes) -> None:
     )
 
 
-def recv_v2_packet(sock) -> tuple[int, bytes]:
-    typ_b = recv_exact(sock, 1)
+def recv_v2_packet(reader: SockReader) -> tuple[int, bytes]:
+    typ_b = reader.read_exact(1)
     typ = typ_b[0]
-    (ln,) = struct.unpack(">I", recv_exact(sock, 4))
+    (ln,) = struct.unpack(">I", reader.read_exact(4))
     if ln > 50 * 1024 * 1024:
         raise ValueError(f"paquet V2 trop grand: {ln}")
-    return typ, recv_exact(sock, ln)
+    return typ, reader.read_exact(ln)
 
 
-def peel_transport(conn) -> tuple[str, object]:
+def peel_transport(reader: SockReader) -> tuple[str, object]:
     """
     Après la ligne CAMERA : détecte legacy (1er JPEG) ou V2.
 
     Retourne :
       ('legacy', jpeg_bytes)
-      ('v2', (sr, ch) | None)  # None = pas d’audio annoncé
+      ('v2', (sr, ch) | None)  # None = pas d'audio annoncé
     """
-    b0 = recv_exact(conn, 1)
+    b0 = reader.read_exact(1)
     if b0 == b"V":
-        line = bytearray(b"V")
-        while len(line) < HEADER_MAX:
-            c = conn.recv(1)
-            if not c:
-                raise ConnectionError("fin de flux (V2)")
-            if c == b"\n":
-                break
-            line.extend(c)
-        if line.decode("utf-8", errors="replace").strip() != "V2":
+        rest = reader.read_line()
+        line_str = ("V" + rest).strip()
+        if line_str != "V2":
             raise ValueError("en-tête V2 attendu après V")
-        nxt = read_line(conn)
+        nxt = reader.read_line()
         audio = None
         if nxt.upper().startswith("AUDIO "):
             parts = nxt.split()
             if len(parts) >= 3:
                 audio = (int(parts[1]), int(parts[2]))
         return "v2", audio
-    ln_bytes = b0 + recv_exact(conn, 3)
+    ln_bytes = b0 + reader.read_exact(3)
     (length,) = struct.unpack(">I", ln_bytes)
     if length > 50 * 1024 * 1024:
         raise ValueError(f"trame JPEG anormalement grande: {length}")
-    jpeg = recv_exact(conn, length)
+    jpeg = reader.read_exact(length)
     return "legacy", jpeg

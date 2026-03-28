@@ -11,17 +11,13 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
 from urllib.parse import urlparse
 
-import cv2
 import numpy as np
+
+from video_app.fast_jpeg import encode_bgr_jpeg_best
 
 
 def _jpeg_bytes(bgr: np.ndarray, quality: int = 85) -> bytes | None:
-    ok, enc = cv2.imencode(
-        ".jpg", bgr, [int(cv2.IMWRITE_JPEG_QUALITY), max(1, min(100, quality))]
-    )
-    if not ok:
-        return None
-    return enc.tobytes()
+    return encode_bgr_jpeg_best(bgr, quality)
 
 
 class MJPEGHTTPServer(ThreadingHTTPServer):
@@ -116,7 +112,7 @@ class MJPEGRequestHandler(BaseHTTPRequestHandler):
             while buf is not None:
                 fr = buf.latest()
                 if fr is not None:
-                    # Copie : latest() ne garde pas le verrou ; imencode en parallèle
+                    # Copie : latest() ne garde pas le verrou ; encodage JPEG en parallèle
                     # des append réseau pourrait sinon toucher un buffer réutilisé.
                     fr = np.ascontiguousarray(fr, dtype=np.uint8).copy()
                     jb = _jpeg_bytes(fr)
